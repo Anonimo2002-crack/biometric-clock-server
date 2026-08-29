@@ -1,0 +1,261 @@
+"""Reportes JSON que consume el tablero Angular de Geovany."""
+
+from __future__ import annotations
+
+from datetime import datetime, timedelta, timezone
+from typing import Any, Literal
+from zoneinfo import ZoneInfo
+
+from prisma import Prisma
+
+TZ = ZoneInfo("America/Guatemala")
+INSTITUCION = "EORM Agua de la Mina"
+JORNADA = "Jornada Vespertina"
+HORA_LIMITE_TARDE_ALUMNOS = "13:15"
+HORA_LIMITE_TARDE_MAESTROS = "12:55"
+
+Estado = Literal["presente", "tarde", "ausente"]
+
+GRADOS: list[dict[str, str]] = [
+    {"id": "1A", "nombre": "1ro Primaria", "seccion": "A"},
+    {"id": "2A", "nombre": "2do Primaria", "seccion": "A"},
+    {"id": "3A", "nombre": "3ro Primaria", "seccion": "A"},
+    {"id": "4A", "nombre": "4to Primaria", "seccion": "A"},
+    {"id": "5A", "nombre": "5to Primaria", "seccion": "A"},
+    {"id": "6A", "nombre": "6to Primaria", "seccion": "A"},
+]
+
+
+def catalogo_grados() -> list[dict[str, str]]:
+    return [dict(item) for item in GRADOS]
+
+
+def etiqueta_grado(grado: dict[str, str]) -> str:
+    return f"{grado['nombre'].replace(' Primaria', '')} {grado['seccion']}"
+
+
+def grado_por_id(grado_id: str) -> dict[str, str]:
+    return next((item for item in GRADOS if item["id"] == grado_id), GRADOS[0])
+
+
+def _minutos(hora: str) -> int:
+    horas, minutos = hora.split(":")
+    return int(horas) * 60 + int(minutos)
+
+
+def _hora_hhmm(valor: datetime) -> str:
+    if valor.tzinfo is None:
+        valor = valor.replace(tzinfo=timezone.utc)
+    return valor.astimezone(TZ).strftime("%H:%M")
+
+
+def estado_por_hora(
+    hora_marca: str | None,
+    limite_tarde: str,
+    hora_corte: str | None = None,
+) -> Estado:
+    if not hora_marca:
+        return "ausente"
+    if hora_corte and _minutos(hora_marca) > _minutos(hora_corte):
+        return "ausente"
+    if _minutos(hora_marca) > _minutos(limite_tarde):
+        return "tarde"
+    return "presente"
+
+
+def totales_de(items: list[dict[str, Any]]) -> dict[str, Any]:
+    matriculados = len(items)
+    presentes = sum(1 for item in items if item["estado"] == "presente")
+    tardes = sum(1 for item in items if item["estado"] == "tarde")
+    ausentes = sum(1 for item in items if item["estado"] == "ausente")
+    porcentaje = 0.0 if matriculados == 0 else round(((presentes + tardes) / matriculados) * 1000) / 10
+    return {
+        "matriculados": matriculados,
+        "presentes": presentes,
+        "tardes": tardes,
+        "ausentes": ausentes,
+        "porcentaje": porcentaje,
+    }
+
+
+def _en_el_dia(valor: datetime, inicio: datetime, fin: datetime) -> bool:
+    if valor.tzinfo is None:
+        valor = valor.replace(tzinfo=timezone.utc)
+    local = valor.astimezone(TZ)
+    return inicio <= local < fin
+
+
+def _primera_entrada(marcajes: list[Any], inicio: datetime, fin: datetime) -> datetime | None:
+    entradas = [
+        row.fechaHora
+        for row in marcajes
+        if row.tipo == "ENTRADA" and _en_el_dia(row.fechaHora, inicio, fin)
+    ]
+    return min(entradas) if entradas else None
+
+
+def _ultima_salida(marcajes: list[Any], inicio: datetime, fin: datetime) -> datetime | None:
+    salidas = [
+        row.fechaHora
+        for row in marcajes
+        if row.tipo == "SALIDA" and _en_el_dia(row.fechaHora, inicio, fin)
+    ]
+    return max(salidas) if salidas else None
+
+
+def _rango_dia(fecha: str) -> tuple[datetime, datetime]:
+    inicio = datetime.strptime(fecha, "%Y-%m-%d").replace(tzinfo=TZ)
+    return inicio, inicio + timedelta(days=1)
+
+
+async def _personas_del_dia(db: Prisma, rol: str) -> list[Any]:
+    return await db.alumno.find_many(
+        where={"activo": True, "rol": rol},
+        include={"marcajes": True},
+        order={"nombre": "asc"},
+    )
+
+
+def _alumno_asistencia(
+    persona: Any,
+    inicio: datetime,
+    fin: datetime,
+    hora_corte: str | None = None,
+) -> dict[str, Any]:
+    grado = grado_por_id(persona.grado or "1A")
+    entrada = _primera_entrada(persona.marcajes or [], inicio, fin)
+    hora_marca = _hora_hhmm(entrada) if entrada else None
+    return {
+        "id": str(persona.id),
+        "nombre": persona.nombre,
+        "gradoId": grado["id"],
+        "grado": etiqueta_grado(grado),
+        "horaMarca": hora_marca,
+        "estado": estado_por_hora(hora_marca, HORA_LIMITE_TARDE_ALUMNOS, hora_corte),
+    }
+
+
+def _maestro_asistencia(persona: Any, inicio: datetime, fin: datetime) -> dict[str, Any]:
+    marcajes = persona.marcajes or []
+    entrada = _primera_entrada(marcajes, inicio, fin)
+    salida = _ultima_salida(marcajes, inicio, fin)
+    hora_entrada = _hora_hhmm(entrada) if entrada else None
+    return {
+        "id": str(persona.id),
+        "nombre": persona.nombre,
+        "cargo": persona.cargo or "Docente",
+        "horaEntrada": hora_entrada,
+        "horaSalida": _hora_hhmm(salida) if salida else None,
+        "estado": estado_por_hora(hora_entrada, HORA_LIMITE_TARDE_MAESTROS),
+    }
+
+
+def resumen_por_grado(alumnos: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    filas = []
+    for grado in GRADOS:
+        del_grado = [item for item in alumnos if item["gradoId"] == grado["id"]]
+        filas.append(
+            {
+                "gradoId": grado["id"],
+                "grado": etiqueta_grado(grado),
+                **totales_de(del_grado),
+            }
+        )
+    return filas
+
+
+async def armar_dashboard(db: Prisma, fecha: str) -> dict[str, Any]:
+    inicio, fin = _rango_dia(fecha)
+    alumnos = [_alumno_asistencia(item, inicio, fin) for item in await _personas_del_dia(db, "ALUMNO")]
+    maestros = [_maestro_asistencia(item, inicio, fin) for item in await _personas_del_dia(db, "CATEDRATICO")]
+    ultimas = [
+        *[
+            {
+                "hora": item["horaMarca"],
+                "nombre": item["nombre"],
+                "rol": "alumno",
+                "detalle": item["grado"],
+                "estado": item["estado"],
+            }
+            for item in alumnos
+            if item["horaMarca"]
+        ],
+        *[
+            {
+                "hora": item["horaEntrada"],
+                "nombre": item["nombre"],
+                "rol": "maestro",
+                "detalle": item["cargo"],
+                "estado": item["estado"],
+            }
+            for item in maestros
+            if item["horaEntrada"]
+        ],
+    ]
+    ultimas.sort(key=lambda item: item["hora"], reverse=True)
+    return {
+        "fecha": fecha,
+        "jornada": JORNADA,
+        "institucion": INSTITUCION,
+        "alumnos": totales_de(alumnos),
+        "maestros": {
+            "total": len(maestros),
+            "presentes": sum(1 for item in maestros if item["estado"] == "presente"),
+            "tardes": sum(1 for item in maestros if item["estado"] == "tarde"),
+            "ausentes": sum(1 for item in maestros if item["estado"] == "ausente"),
+        },
+        "porGrado": resumen_por_grado(alumnos),
+        "ultimasMarcas": ultimas[:8],
+    }
+
+
+async def armar_asistencia_grado(db: Prisma, fecha: str, grado_id: str) -> dict[str, Any]:
+    inicio, fin = _rango_dia(fecha)
+    grado = grado_por_id(grado_id)
+    alumnos = [
+        item
+        for item in [
+            _alumno_asistencia(row, inicio, fin) for row in await _personas_del_dia(db, "ALUMNO")
+        ]
+        if item["gradoId"] == grado["id"]
+    ]
+    return {
+        "fecha": fecha,
+        "gradoId": grado["id"],
+        "grado": etiqueta_grado(grado),
+        "totales": totales_de(alumnos),
+        "alumnos": alumnos,
+    }
+
+
+async def armar_ausencias(db: Prisma, fecha: str, hora_corte: str) -> dict[str, Any]:
+    inicio, fin = _rango_dia(fecha)
+    del_dia = [
+        _alumno_asistencia(row, inicio, fin, hora_corte)
+        for row in await _personas_del_dia(db, "ALUMNO")
+    ]
+    ausentes = [item for item in del_dia if item["estado"] == "ausente"]
+    return {
+        "fecha": fecha,
+        "horaCorte": hora_corte,
+        "totalAusentes": len(ausentes),
+        "porGrado": resumen_por_grado(del_dia),
+        "alumnos": ausentes,
+    }
+
+
+async def armar_maestros(db: Prisma, fecha: str) -> dict[str, Any]:
+    inicio, fin = _rango_dia(fecha)
+    maestros = [
+        _maestro_asistencia(item, inicio, fin) for item in await _personas_del_dia(db, "CATEDRATICO")
+    ]
+    return {
+        "fecha": fecha,
+        "totales": {
+            "total": len(maestros),
+            "presentes": sum(1 for item in maestros if item["estado"] == "presente"),
+            "tardes": sum(1 for item in maestros if item["estado"] == "tarde"),
+            "ausentes": sum(1 for item in maestros if item["estado"] == "ausente"),
+        },
+        "maestros": maestros,
+    }

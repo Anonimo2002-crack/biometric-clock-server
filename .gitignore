@@ -1,0 +1,12 @@
+venv/
+asistencia.db
+asistencia.db-journal
+.env
+.mysql-data/
+.mysql-data-dev/
+.mysql-data-0/
+__pycache__/
+*.pyc
+.prisma/
+biometric-clock-client/
+*.log

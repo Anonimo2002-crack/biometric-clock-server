@@ -1,0 +1,44 @@
+// SQLite en la laptop. En el servidor Debian de Geovany se puede
+// cambiar a provider = "mysql" y DATABASE_URL de MySQL.
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider             = "prisma-client-py"
+  recursive_type_depth = 5
+  interface            = "asyncio"
+}
+
+// Alumno también cubre catedráticos y el admin del aparato (campo rol).
+model Alumno {
+  id         Int          @id @default(autoincrement())
+  nombre     String
+  codigo     String       @unique
+  employeeNo String       @unique
+  grado      String?
+  cargo      String?
+  rol        String       @default("ALUMNO")
+  activo     Boolean      @default(true)
+  creadoEn   DateTime     @default(now())
+  marcajes   Asistencia[]
+
+  @@map("alumnos")
+}
+
+model Asistencia {
+  id            Int      @id @default(autoincrement())
+  alumnoId      Int
+  fechaHora     DateTime
+  tipo          String
+  metodo        String   @default("ROSTRO")
+  serialEvento  String?  @unique
+  dispositivoIp String?
+  creadoEn      DateTime @default(now())
+  alumno        Alumno   @relation(fields: [alumnoId], references: [id])
+
+  @@index([fechaHora])
+  @@index([alumnoId, fechaHora])
+  @@map("asistencias")
+}
