@@ -14,7 +14,7 @@ pip install -r requirements.txt
 copy .env.example .env
 ```
 
-Edita `.env`: IP del reloj y la contraseña `admin` del aparato. **No subas `.env` a GitHub.**
+Editar `.env`: IP del reloj y la contraseña `admin` del aparato. a GitHub.**
 
 ```powershell
 $env:PATH = "$(Get-Location)\venv\Scripts;" + $env:PATH
