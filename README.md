@@ -25,6 +25,32 @@ python -m uvicorn biometric-clock-server:app --host 0.0.0.0 --port 8000
 
 Swagger: http://127.0.0.1:8000/docs
 
+## MySQL (PC de la escuela / Debian)
+
+En el desarrollo de Jarod la API usó **SQLite** (`asistencia.db`, no se sube a GitHub). En producción toca **MySQL**.
+
+El diseño de tablas está en:
+
+- `schema.prisma` — modelos `Alumno` y `Asistencia`
+- [`mysql/asistencia.sql`](mysql/asistencia.sql) — `CREATE DATABASE` + `alumnos` + `asistencias`
+
+No hay tabla `usuarios` de login. Los “usuarios” del colegio son filas de `alumnos` (`rol`: `ALUMNO`, `CATEDRATICO` o `ADMIN`). El Hikvision guarda las caras aparte.
+
+En Debian:
+
+```bash
+mysql -u root -p < mysql/asistencia.sql
+```
+
+En `.env`:
+
+```
+DATABASE_URL=mysql://USUARIO:CLAVE@127.0.0.1:3306/asistencia_db
+```
+
+En `schema.prisma` cambia `provider = "sqlite"` por `provider = "mysql"`, luego `prisma generate` y `prisma db push` (o usa solo el `.sql` de arriba).
+
+
 ## Contrato (tablero Angular)
 
 | Método | Ruta | Query |
