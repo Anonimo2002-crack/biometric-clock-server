@@ -23,6 +23,7 @@ from reportes import (
     armar_maestros,
     catalogo_grados,
 )
+from seed import seed_demo_si_vacio
 
 load_dotenv()
 
@@ -34,6 +35,7 @@ DEVICE_USER = os.getenv("DEVICE_USER", "admin")
 DEVICE_PASS = os.getenv("DEVICE_PASS", "")
 DEVICE_TIMEOUT = int(os.getenv("DEVICE_TIMEOUT", "10"))
 CORS_ORIGINS = [item.strip() for item in os.getenv("CORS_ORIGINS", "*").split(",") if item.strip()]
+HORAS_CORTE_VALIDAS = {"13:15", "14:00", "15:00", "16:00"}
 
 
 def hikvision() -> HikvisionClient:
@@ -59,6 +61,8 @@ async def _seed_admin() -> None:
 async def lifespan(_app: FastAPI):
     await db.connect()
     await _seed_admin()
+    if os.getenv("SEED_DEMO", "").strip().lower() in {"1", "true", "yes"}:
+        await seed_demo_si_vacio(db)
     yield
     await db.disconnect()
 
@@ -400,6 +404,11 @@ async def get_ausencias(
     horaCorte: str = Query("13:15", description="13:15, 14:00, 15:00 o 16:00"),
 ) -> dict[str, Any]:
     _inicio_fin_dia(fecha)
+    if horaCorte not in HORAS_CORTE_VALIDAS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"horaCorte inválida. Usa: {sorted(HORAS_CORTE_VALIDAS)}",
+        )
     return await armar_ausencias(db, _fecha_query(fecha), horaCorte)
 
 

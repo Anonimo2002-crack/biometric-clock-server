@@ -108,10 +108,14 @@ def _rango_dia(fecha: str) -> tuple[datetime, datetime]:
     return inicio, inicio + timedelta(days=1)
 
 
-async def _personas_del_dia(db: Prisma, rol: str) -> list[Any]:
+async def _personas_del_dia(db: Prisma, rol: str, inicio: datetime, fin: datetime) -> list[Any]:
     return await db.alumno.find_many(
         where={"activo": True, "rol": rol},
-        include={"marcajes": True},
+        include={
+            "marcajes": {
+                "where": {"fechaHora": {"gte": inicio, "lt": fin}},
+            }
+        },
         order={"nombre": "asc"},
     )
 
@@ -166,8 +170,10 @@ def resumen_por_grado(alumnos: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 async def armar_dashboard(db: Prisma, fecha: str) -> dict[str, Any]:
     inicio, fin = _rango_dia(fecha)
-    alumnos = [_alumno_asistencia(item, inicio, fin) for item in await _personas_del_dia(db, "ALUMNO")]
-    maestros = [_maestro_asistencia(item, inicio, fin) for item in await _personas_del_dia(db, "CATEDRATICO")]
+    alumnos = [_alumno_asistencia(item, inicio, fin) for item in await _personas_del_dia(db, "ALUMNO", inicio, fin)]
+    maestros = [
+        _maestro_asistencia(item, inicio, fin) for item in await _personas_del_dia(db, "CATEDRATICO", inicio, fin)
+    ]
     ultimas = [
         *[
             {
@@ -206,6 +212,7 @@ async def armar_dashboard(db: Prisma, fecha: str) -> dict[str, Any]:
         },
         "porGrado": resumen_por_grado(alumnos),
         "ultimasMarcas": ultimas[:8],
+        "sinMatricula": len(alumnos) == 0,
     }
 
 
@@ -215,7 +222,7 @@ async def armar_asistencia_grado(db: Prisma, fecha: str, grado_id: str) -> dict[
     alumnos = [
         item
         for item in [
-            _alumno_asistencia(row, inicio, fin) for row in await _personas_del_dia(db, "ALUMNO")
+            _alumno_asistencia(row, inicio, fin) for row in await _personas_del_dia(db, "ALUMNO", inicio, fin)
         ]
         if item["gradoId"] == grado["id"]
     ]
@@ -232,7 +239,7 @@ async def armar_ausencias(db: Prisma, fecha: str, hora_corte: str) -> dict[str, 
     inicio, fin = _rango_dia(fecha)
     del_dia = [
         _alumno_asistencia(row, inicio, fin, hora_corte)
-        for row in await _personas_del_dia(db, "ALUMNO")
+        for row in await _personas_del_dia(db, "ALUMNO", inicio, fin)
     ]
     ausentes = [item for item in del_dia if item["estado"] == "ausente"]
     return {
@@ -247,7 +254,8 @@ async def armar_ausencias(db: Prisma, fecha: str, hora_corte: str) -> dict[str, 
 async def armar_maestros(db: Prisma, fecha: str) -> dict[str, Any]:
     inicio, fin = _rango_dia(fecha)
     maestros = [
-        _maestro_asistencia(item, inicio, fin) for item in await _personas_del_dia(db, "CATEDRATICO")
+        _maestro_asistencia(item, inicio, fin)
+        for item in await _personas_del_dia(db, "CATEDRATICO", inicio, fin)
     ]
     return {
         "fecha": fecha,
