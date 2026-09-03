@@ -1,7 +1,6 @@
-// SQLite en la laptop. En el servidor Debian de Geovany se puede
-// cambiar a provider = "mysql" y DATABASE_URL de MySQL.
+// MySQL local (Workbench: asistencia_db). En Debian usa el mismo provider.
 datasource db {
-  provider = "sqlite"
+  provider = "mysql"
   url      = env("DATABASE_URL")
 }
 
@@ -19,12 +18,32 @@ model Alumno {
   employeeNo String       @unique
   grado      String?
   cargo      String?
-  rol        String       @default("ALUMNO")
-  activo     Boolean      @default(true)
-  creadoEn   DateTime     @default(now())
-  marcajes   Asistencia[]
+  // Datos que llena la dirección. El teléfono es obligatorio para alumnos y el
+  // correo solo se usa si quieren avisos por SMTP.
+  fechaNacimiento DateTime?
+  telefonoPadres  String?
+  correoPadres    String?
+  rol           String       @default("ALUMNO")
+  activo        Boolean      @default(true)
+  creadoEn      DateTime     @default(now())
+  actualizadoEn DateTime     @default(now()) @updatedAt
+  marcajes      Asistencia[]
 
   @@map("alumnos")
+}
+
+// Cuentas del tablero web. Distinto del rol ALUMNO/CATEDRATICO del reloj.
+model Usuario {
+  id            Int      @id @default(autoincrement())
+  nombre        String
+  usuario       String   @unique
+  passwordHash  String
+  rol           String
+  activo        Boolean  @default(true)
+  creadoEn      DateTime @default(now())
+  actualizadoEn DateTime @default(now()) @updatedAt
+
+  @@map("usuarios")
 }
 
 model Asistencia {

@@ -14,7 +14,7 @@ pip install -r requirements.txt
 copy .env.example .env
 ```
 
-Editar `.env`: IP del reloj y la contraseña `admin` del aparato. a GitHub.**
+Editar `.env`: `DATABASE_URL` de MySQL, IP del reloj y la contraseña `admin` del aparato. **No subas el `.env` a GitHub.**
 
 ```powershell
 $env:PATH = "$(Get-Location)\venv\Scripts;" + $env:PATH
