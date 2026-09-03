@@ -10,29 +10,108 @@ generator client {
   interface            = "asyncio"
 }
 
-// Alumno también cubre catedráticos y el admin del aparato (campo rol).
-model Alumno {
-  id         Int          @id @default(autoincrement())
-  nombre     String
-  codigo     String       @unique
-  employeeNo String       @unique
-  grado      String?
-  cargo      String?
-  // Datos que llena la dirección. El teléfono es obligatorio para alumnos y el
-  // correo solo se usa si quieren avisos por SMTP.
-  fechaNacimiento DateTime?
-  telefonoPadres  String?
-  correoPadres    String?
-  rol           String       @default("ALUMNO")
-  activo        Boolean      @default(true)
-  creadoEn      DateTime     @default(now())
-  actualizadoEn DateTime     @default(now()) @updatedAt
-  marcajes      Asistencia[]
+// --- Personas ---
+//
+// Alumnos, catedráticos y el admin del aparato comparten lo mismo: un nombre,
+// un código y un número en el reloj. Por eso viven en una sola tabla y lo que
+// cambia entre unos y otros cuelga en las tablas de detalle.
+// Se hace así, y no con una tabla por tipo, porque los marcajes tienen que
+// apuntar a una sola tabla para no perder la integridad referencial.
+model Persona {
+  id            Int      @id @default(autoincrement())
+  nombre        String
+  codigo        String   @unique
+  employeeNo    String   @unique
+  rol           String   @default("ALUMNO")
+  activo        Boolean  @default(true)
+  creadoEn      DateTime @default(now())
+  actualizadoEn DateTime @default(now()) @updatedAt
 
-  @@map("alumnos")
+  detalleAlumno      DetalleAlumno?
+  detalleCatedratico DetalleCatedratico?
+  marcajes           Asistencia[]
+
+  @@index([rol, activo])
+  @@map("personas")
 }
 
-// Cuentas del tablero web. Distinto del rol ALUMNO/CATEDRATICO del reloj.
+// Lo que solo aplica a un alumno. Uno a uno con Persona.
+model DetalleAlumno {
+  personaId       Int       @id
+  gradoId         String
+  fechaNacimiento DateTime?
+  telefonoPadres  String
+  correoPadres    String?
+
+  persona Persona @relation(fields: [personaId], references: [id], onDelete: Cascade)
+  grado   Grado   @relation(fields: [gradoId], references: [id])
+
+  @@index([gradoId])
+  @@map("alumnos_detalle")
+}
+
+// Lo que solo aplica a un catedrático. Uno a uno con Persona.
+model DetalleCatedratico {
+  personaId Int     @id
+  cargo     String?
+
+  persona Persona @relation(fields: [personaId], references: [id], onDelete: Cascade)
+
+  @@map("catedraticos_detalle")
+}
+
+// --- Catálogos ---
+
+model Grado {
+  id      String  @id
+  nombre  String
+  seccion String
+  orden   Int
+  activo  Boolean @default(true)
+
+  alumnos DetalleAlumno[]
+
+  @@map("grados")
+}
+
+// Cada reloj biométrico. Antes era solo una IP suelta en el marcaje.
+model Dispositivo {
+  id        Int      @id @default(autoincrement())
+  ip        String   @unique
+  nombre    String
+  ubicacion String?
+  activo    Boolean  @default(true)
+  creadoEn  DateTime @default(now())
+
+  marcajes Asistencia[]
+
+  @@map("dispositivos")
+}
+
+// --- Movimiento ---
+
+model Asistencia {
+  id            Int      @id @default(autoincrement())
+  personaId     Int
+  dispositivoId Int?
+  fechaHora     DateTime
+  tipo          String
+  metodo        String   @default("ROSTRO")
+  serialEvento  String?  @unique
+  creadoEn      DateTime @default(now())
+
+  persona     Persona      @relation(fields: [personaId], references: [id])
+  dispositivo Dispositivo? @relation(fields: [dispositivoId], references: [id])
+
+  @@index([fechaHora])
+  @@index([personaId, fechaHora])
+  @@map("asistencias")
+}
+
+// --- Acceso al tablero ---
+//
+// Nada que ver con el rol del reloj: aquí van las cuentas de quienes usan la
+// página web (dirección, secretaría, docentes).
 model Usuario {
   id            Int      @id @default(autoincrement())
   nombre        String
@@ -44,20 +123,4 @@ model Usuario {
   actualizadoEn DateTime @default(now()) @updatedAt
 
   @@map("usuarios")
-}
-
-model Asistencia {
-  id            Int      @id @default(autoincrement())
-  alumnoId      Int
-  fechaHora     DateTime
-  tipo          String
-  metodo        String   @default("ROSTRO")
-  serialEvento  String?  @unique
-  dispositivoIp String?
-  creadoEn      DateTime @default(now())
-  alumno        Alumno   @relation(fields: [alumnoId], references: [id])
-
-  @@index([fechaHora])
-  @@index([alumnoId, fechaHora])
-  @@map("asistencias")
 }

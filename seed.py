@@ -1,4 +1,4 @@
-"""Matrícula de demostración para la laptop, cuando no hay reloj conectado."""
+"""Catálogos base y matrícula de demostración para la laptop."""
 
 from __future__ import annotations
 
@@ -8,6 +8,17 @@ from zoneinfo import ZoneInfo
 from prisma import Prisma
 
 TZ = ZoneInfo("America/Guatemala")
+
+# Los seis grados de la jornada vespertina. Se cargan una sola vez y desde ahí
+# la escuela puede editarlos en la base sin tocar el código.
+GRADOS: list[tuple[str, str, str, int]] = [
+    ("1A", "1ro Primaria", "A", 1),
+    ("2A", "2do Primaria", "A", 2),
+    ("3A", "3ro Primaria", "A", 3),
+    ("4A", "4to Primaria", "A", 4),
+    ("5A", "5to Primaria", "A", 5),
+    ("6A", "6to Primaria", "A", 6),
+]
 
 ALUMNOS: list[tuple[str, str]] = [
     ("Ana López", "1A"),
@@ -48,21 +59,45 @@ CATEDRATICOS: list[tuple[str, str]] = [
 ]
 
 
+async def seed_catalogos(db: Prisma, ips: list[str]) -> None:
+    """Grados y relojes. Sin esto no se puede matricular a nadie."""
+    for grado_id, nombre, seccion, orden in GRADOS:
+        await db.grado.upsert(
+            where={"id": grado_id},
+            data={
+                "create": {"id": grado_id, "nombre": nombre, "seccion": seccion, "orden": orden},
+                "update": {"nombre": nombre, "seccion": seccion, "orden": orden},
+            },
+        )
+
+    for numero, ip in enumerate(ips, start=1):
+        await db.dispositivo.upsert(
+            where={"ip": ip},
+            data={
+                "create": {"ip": ip, "nombre": f"Reloj {numero}"},
+                "update": {},
+            },
+        )
+
+
 async def seed_demo_si_vacio(db: Prisma) -> None:
-    existe = await db.alumno.find_first(where={"rol": "ALUMNO"})
+    existe = await db.persona.find_first(where={"rol": "ALUMNO"})
     if existe is not None:
         return
 
     hoy = datetime.now(TZ).replace(hour=0, minute=0, second=0, microsecond=0)
+    reloj = await db.dispositivo.find_first()
 
     for index, (nombre, grado) in enumerate(ALUMNOS):
-        persona = await db.alumno.create(
+        persona = await db.persona.create(
             data={
                 "nombre": nombre,
                 "codigo": f"ALU-{grado}-{index + 1:02d}",
                 "employeeNo": f"DEMO-A-{index + 1:02d}",
-                "grado": grado,
                 "rol": "ALUMNO",
+                "detalleAlumno": {
+                    "create": {"gradoId": grado, "telefonoPadres": "0000-0000"},
+                },
             }
         )
         # 1 de cada 6 ausente; 1 de cada 5 presente llega tarde.
@@ -71,7 +106,8 @@ async def seed_demo_si_vacio(db: Prisma) -> None:
         minutos = (13 * 60 + 22) if index % 5 == 0 else (12 * 60 + 54 + (index % 8))
         await db.asistencia.create(
             data={
-                "alumnoId": persona.id,
+                "personaId": persona.id,
+                "dispositivoId": reloj.id if reloj else None,
                 "fechaHora": hoy + timedelta(minutes=minutos),
                 "tipo": "ENTRADA",
                 "metodo": "ROSTRO",
@@ -80,13 +116,13 @@ async def seed_demo_si_vacio(db: Prisma) -> None:
         )
 
     for index, (nombre, cargo) in enumerate(CATEDRATICOS):
-        persona = await db.alumno.create(
+        persona = await db.persona.create(
             data={
                 "nombre": nombre,
                 "codigo": f"DOC-{index + 1:02d}",
                 "employeeNo": f"DEMO-M-{index + 1:02d}",
-                "cargo": cargo,
                 "rol": "CATEDRATICO",
+                "detalleCatedratico": {"create": {"cargo": cargo}},
             }
         )
         if index == 7:
@@ -94,7 +130,8 @@ async def seed_demo_si_vacio(db: Prisma) -> None:
         minutos = (13 * 60 + 8) if index == 5 else (12 * 60 + 38 + index)
         await db.asistencia.create(
             data={
-                "alumnoId": persona.id,
+                "personaId": persona.id,
+                "dispositivoId": reloj.id if reloj else None,
                 "fechaHora": hoy + timedelta(minutes=minutos),
                 "tipo": "ENTRADA",
                 "metodo": "ROSTRO",
@@ -104,7 +141,8 @@ async def seed_demo_si_vacio(db: Prisma) -> None:
         if index < 6:
             await db.asistencia.create(
                 data={
-                    "alumnoId": persona.id,
+                    "personaId": persona.id,
+                    "dispositivoId": reloj.id if reloj else None,
                     "fechaHora": hoy + timedelta(hours=17, minutes=22 + index),
                     "tipo": "SALIDA",
                     "metodo": "ROSTRO",

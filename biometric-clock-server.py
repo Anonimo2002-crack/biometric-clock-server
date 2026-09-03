@@ -58,7 +58,7 @@ from reportes import (
     armar_maestros,
     catalogo_grados,
 )
-from seed import seed_demo_si_vacio
+from seed import seed_catalogos, seed_demo_si_vacio
 from zoneinfo import ZoneInfo
 
 TZ = ZoneInfo("America/Guatemala")
@@ -103,9 +103,9 @@ def hikvision(ip: str | None = None) -> HikvisionClient:
 
 
 async def _seed_admin_reloj() -> None:
-    existe = await db.alumno.find_unique(where={"employeeNo": "1"})
+    existe = await db.persona.find_unique(where={"employeeNo": "1"})
     if existe is None:
-        await db.alumno.create(
+        await db.persona.create(
             data={
                 "nombre": "Jarod Fernando Fernandez Morales",
                 "codigo": "ADM-001",
@@ -133,6 +133,7 @@ async def _seed_usuario_admin() -> None:
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     await db.connect()
+    await seed_catalogos(db, device_ips())
     await _seed_admin_reloj()
     await _seed_usuario_admin()
     if os.getenv("SEED_DEMO", "").strip().lower() in {"1", "true", "yes"}:
@@ -409,7 +410,7 @@ PREFIJO_CODIGO = {"ALUMNO": "ALU", "CATEDRATICO": "DOC", "ADMIN": "ADM"}
 
 async def _siguiente_employee_no(rol: str) -> str:
     desde = INICIO_NUMERO.get(rol, 1000)
-    filas = await db.alumno.find_many()
+    filas = await db.persona.find_many()
     usados = set()
     for fila in filas:
         if fila.employeeNo.isdigit():
@@ -422,7 +423,7 @@ async def _siguiente_employee_no(rol: str) -> str:
 
 async def _siguiente_codigo(rol: str) -> str:
     prefijo = PREFIJO_CODIGO.get(rol, "ALU")
-    filas = await db.alumno.find_many(where={"rol": rol})
+    filas = await db.persona.find_many(where={"rol": rol})
     usados = set()
     for fila in filas:
         cola = fila.codigo.rsplit("-", 1)[-1]
@@ -449,43 +450,123 @@ def _parse_fecha_nacimiento(valor: str | None) -> datetime | None:
     return datetime(dia.year, dia.month, dia.day)
 
 
-async def _datos_alumno(payload: AlumnoIn) -> dict[str, Any]:
+# Persona siempre se lee con sus detalles, porque el tablero espera la ficha
+# completa (grado, cargo, datos de los padres) en un solo objeto plano.
+INCLUDE_PERSONA: dict[str, Any] = {
+    "detalleAlumno": {"include": {"grado": True}},
+    "detalleCatedratico": True,
+}
+
+
+def _alumno_out(fila: Any) -> AlumnoOut:
+    """Aplana Persona + su detalle al formato que ya conoce el tablero."""
+    alumno = getattr(fila, "detalleAlumno", None)
+    catedratico = getattr(fila, "detalleCatedratico", None)
+    return AlumnoOut(
+        id=fila.id,
+        nombre=fila.nombre,
+        codigo=fila.codigo,
+        employeeNo=fila.employeeNo,
+        grado=alumno.gradoId if alumno else None,
+        cargo=catedratico.cargo if catedratico else None,
+        fechaNacimiento=alumno.fechaNacimiento if alumno else None,
+        telefonoPadres=alumno.telefonoPadres if alumno else None,
+        correoPadres=alumno.correoPadres if alumno else None,
+        rol=fila.rol,
+        activo=fila.activo,
+    )
+
+
+async def _partes_persona(
+    payload: AlumnoIn,
+    actual: Any | None = None,
+) -> tuple[dict[str, Any], dict[str, Any] | None, dict[str, Any] | None]:
+    """Valida y reparte el formulario entre la tabla base y la de detalle."""
     rol = _validar_rol_reloj(payload.rol)
     grado = (payload.grado or "").strip() or None
-    if rol == "ALUMNO" and not grado:
-        raise HTTPException(status_code=400, detail="El alumno necesita un grado (1A a 6A).")
+    detalle_alumno: dict[str, Any] | None = None
+    detalle_catedratico: dict[str, Any] | None = None
 
-    telefono = (payload.telefonoPadres or "").strip() or None
-    if rol == "ALUMNO" and not telefono:
-        raise HTTPException(
-            status_code=400, detail="El teléfono de los padres es obligatorio para el alumno."
-        )
-    correo = (payload.correoPadres or "").strip() or None
-    if correo and ("@" not in correo or "." not in correo.split("@")[-1]):
-        raise HTTPException(status_code=400, detail="Ese correo de los padres no se ve válido.")
+    if rol == "ALUMNO":
+        if not grado:
+            raise HTTPException(status_code=400, detail="El alumno necesita un grado (1A a 6A).")
+        if await db.grado.find_unique(where={"id": grado}) is None:
+            raise HTTPException(status_code=400, detail=f"El grado {grado} no está en el catálogo.")
+        telefono = (payload.telefonoPadres or "").strip() or None
+        if not telefono:
+            raise HTTPException(
+                status_code=400, detail="El teléfono de los padres es obligatorio para el alumno."
+            )
+        correo = (payload.correoPadres or "").strip() or None
+        if correo and ("@" not in correo or "." not in correo.split("@")[-1]):
+            raise HTTPException(status_code=400, detail="Ese correo de los padres no se ve válido.")
+        detalle_alumno = {
+            "gradoId": grado,
+            "fechaNacimiento": _parse_fecha_nacimiento(payload.fechaNacimiento),
+            "telefonoPadres": telefono,
+            "correoPadres": correo,
+        }
+    elif rol == "CATEDRATICO":
+        detalle_catedratico = {"cargo": (payload.cargo or "").strip() or None}
 
-    codigo = (payload.codigo or "").strip() or await _siguiente_codigo(rol)
-    employee_no = (payload.employeeNo or "").strip() or await _siguiente_employee_no(rol)
-    return {
+    codigo = (payload.codigo or "").strip() or (actual.codigo if actual else await _siguiente_codigo(rol))
+    employee_no = (payload.employeeNo or "").strip() or (
+        actual.employeeNo if actual else await _siguiente_employee_no(rol)
+    )
+    base = {
         "nombre": payload.nombre.strip(),
         "codigo": codigo,
         "employeeNo": employee_no,
-        "grado": None if rol == "CATEDRATICO" else grado,
-        "cargo": (payload.cargo or "").strip() or None,
-        "fechaNacimiento": _parse_fecha_nacimiento(payload.fechaNacimiento),
-        "telefonoPadres": telefono,
-        "correoPadres": correo,
         "rol": rol,
         "activo": payload.activo,
     }
+    return base, detalle_alumno, detalle_catedratico
 
 
-async def _siguiente_tipo(alumno_id: int, cuando: datetime) -> str:
+async def _guardar_detalles(
+    persona_id: int,
+    detalle_alumno: dict[str, Any] | None,
+    detalle_catedratico: dict[str, Any] | None,
+) -> None:
+    """Deja solo el detalle que corresponde al rol y borra el del otro."""
+    if detalle_alumno is not None:
+        await db.detallealumno.upsert(
+            where={"personaId": persona_id},
+            data={
+                "create": {"personaId": persona_id, **detalle_alumno},
+                "update": detalle_alumno,
+            },
+        )
+    else:
+        await db.detallealumno.delete(where={"personaId": persona_id})
+
+    if detalle_catedratico is not None:
+        await db.detallecatedratico.upsert(
+            where={"personaId": persona_id},
+            data={
+                "create": {"personaId": persona_id, **detalle_catedratico},
+                "update": detalle_catedratico,
+            },
+        )
+    else:
+        await db.detallecatedratico.delete(where={"personaId": persona_id})
+
+
+async def _dispositivo_id(ip: str) -> int:
+    """Busca el reloj por IP y lo da de alta si es uno que aún no estaba."""
+    fila = await db.dispositivo.upsert(
+        where={"ip": ip},
+        data={"create": {"ip": ip, "nombre": f"Reloj {ip}"}, "update": {}},
+    )
+    return fila.id
+
+
+async def _siguiente_tipo(persona_id: int, cuando: datetime) -> str:
     inicio = datetime(cuando.year, cuando.month, cuando.day, tzinfo=cuando.tzinfo)
     fin = inicio + timedelta(days=1)
     ultimo = await db.asistencia.find_first(
         where={
-            "alumnoId": alumno_id,
+            "personaId": persona_id,
             "fechaHora": {"gte": inicio, "lt": fin},
         },
         order={"fechaHora": "desc"},
@@ -496,19 +577,21 @@ async def _siguiente_tipo(alumno_id: int, cuando: datetime) -> str:
 
 
 async def _serializar_asistencia(row: Any) -> AsistenciaOut:
-    alumno = row.alumno
+    persona = row.persona
+    detalle = getattr(persona, "detalleAlumno", None) if persona else None
+    dispositivo = getattr(row, "dispositivo", None)
     return AsistenciaOut(
         id=row.id,
-        alumnoId=row.alumnoId,
-        nombre=alumno.nombre if alumno else "",
-        codigo=alumno.codigo if alumno else "",
-        grado=alumno.grado if alumno else None,
-        rol=alumno.rol if alumno else "",
+        alumnoId=row.personaId,
+        nombre=persona.nombre if persona else "",
+        codigo=persona.codigo if persona else "",
+        grado=detalle.gradoId if detalle else None,
+        rol=persona.rol if persona else "",
         fechaHora=row.fechaHora,
         tipo=row.tipo,
         metodo=row.metodo,
         serialEvento=row.serialEvento,
-        dispositivoIp=row.dispositivoIp,
+        dispositivoIp=dispositivo.ip if dispositivo else None,
     )
 
 
@@ -546,10 +629,10 @@ async def _sincronizar_ip(ip: str, inicio: datetime, fin: datetime, dia: str) ->
         cuando = _parse_evento_tiempo(evento.get("time")) or datetime.now(TZ)
         if cuando.astimezone(TZ).date() != inicio.date():
             continue
-        alumno = await db.alumno.find_unique(where={"employeeNo": employee_no})
-        if alumno is None:
+        persona = await db.persona.find_unique(where={"employeeNo": employee_no})
+        if persona is None:
             nombre = str(evento.get("name") or f"Usuario {employee_no}").strip()
-            alumno = await db.alumno.create(
+            persona = await db.persona.create(
                 data={
                     "nombre": nombre,
                     "codigo": f"AUTO-{employee_no}",
@@ -558,15 +641,15 @@ async def _sincronizar_ip(ip: str, inicio: datetime, fin: datetime, dia: str) ->
                 }
             )
             creados_al_vuelo += 1
-        tipo = await _siguiente_tipo(alumno.id, cuando)
+        tipo = await _siguiente_tipo(persona.id, cuando)
         await db.asistencia.create(
             data={
-                "alumnoId": alumno.id,
+                "personaId": persona.id,
+                "dispositivoId": await _dispositivo_id(ip),
                 "fechaHora": cuando,
                 "tipo": tipo,
                 "metodo": _metodo_evento(evento),
                 "serialEvento": serial_key,
-                "dispositivoIp": ip,
             }
         )
         nuevos += 1
@@ -812,7 +895,7 @@ async def get_personas_dispositivo(
         for item in personas
         if str(item.get("employeeNo") or "").strip()
     }
-    matricula = await db.alumno.find_many(where={"activo": True})
+    matricula = await db.persona.find_many(where={"activo": True})
     en_bd = {fila.employeeNo: fila.nombre for fila in matricula}
 
     return {
@@ -846,8 +929,8 @@ async def listar_alumnos(
         where["activo"] = True
     if rol:
         where["rol"] = rol.upper()
-    filas = await db.alumno.find_many(where=where, order={"nombre": "asc"})
-    return [AlumnoOut.model_validate(fila) for fila in filas]
+    filas = await db.persona.find_many(where=where, include=INCLUDE_PERSONA, order={"nombre": "asc"})
+    return [_alumno_out(fila) for fila in filas]
 
 
 @app.get("/api/alumnos/siguiente-codigo")
@@ -869,11 +952,16 @@ async def crear_alumno(
     payload: AlumnoIn,
     _: Any = Depends(require_roles(*ROLES_MATRICULA_ESCRIBIR)),
 ) -> AlumnoOut:
+    base, detalle_alumno, detalle_catedratico = await _partes_persona(payload)
+    if detalle_alumno is not None:
+        base["detalleAlumno"] = {"create": detalle_alumno}
+    if detalle_catedratico is not None:
+        base["detalleCatedratico"] = {"create": detalle_catedratico}
     try:
-        fila = await db.alumno.create(data=await _datos_alumno(payload))
+        fila = await db.persona.create(data=base, include=INCLUDE_PERSONA)
     except UniqueViolationError as exc:
         raise HTTPException(status_code=409, detail="codigo o employeeNo ya existe") from exc
-    return AlumnoOut.model_validate(fila)
+    return _alumno_out(fila)
 
 
 @app.put("/api/alumnos/{alumno_id}", response_model=AlumnoOut)
@@ -882,14 +970,17 @@ async def editar_alumno(
     payload: AlumnoIn,
     _: Any = Depends(require_roles(*ROLES_MATRICULA_ESCRIBIR)),
 ) -> AlumnoOut:
-    actual = await db.alumno.find_unique(where={"id": alumno_id})
+    actual = await db.persona.find_unique(where={"id": alumno_id})
     if actual is None:
         raise HTTPException(status_code=404, detail="No está en la matrícula.")
+    base, detalle_alumno, detalle_catedratico = await _partes_persona(payload, actual)
     try:
-        fila = await db.alumno.update(where={"id": alumno_id}, data=await _datos_alumno(payload))
+        await db.persona.update(where={"id": alumno_id}, data=base)
     except UniqueViolationError as exc:
         raise HTTPException(status_code=409, detail="codigo o employeeNo ya existe") from exc
-    return AlumnoOut.model_validate(fila)
+    await _guardar_detalles(alumno_id, detalle_alumno, detalle_catedratico)
+    fila = await db.persona.find_unique(where={"id": alumno_id}, include=INCLUDE_PERSONA)
+    return _alumno_out(fila)
 
 
 @app.delete("/api/alumnos/{alumno_id}", response_model=AlumnoOut)
@@ -897,10 +988,12 @@ async def baja_alumno(
     alumno_id: int,
     _: Any = Depends(require_roles(*ROLES_MATRICULA_ESCRIBIR)),
 ) -> AlumnoOut:
-    actual = await db.alumno.find_unique(where={"id": alumno_id})
+    actual = await db.persona.find_unique(where={"id": alumno_id})
     if actual is None:
         raise HTTPException(status_code=404, detail="No está en la matrícula.")
-    fila = await db.alumno.update(where={"id": alumno_id}, data={"activo": False})
+    fila = await db.persona.update(
+        where={"id": alumno_id}, data={"activo": False}, include=INCLUDE_PERSONA
+    )
 
     # Quien ya no está en la matrícula tampoco debe poder marcar en el reloj.
     # Si el reloj no contesta, la baja en la BD igual queda hecha.
@@ -908,14 +1001,14 @@ async def baja_alumno(
         hikvision(ip).delete_user(actual.employeeNo)
 
     await _en_cada_reloj(quitar)
-    return AlumnoOut.model_validate(fila)
+    return _alumno_out(fila)
 
 
 # --- enrolamiento en los relojes ---
 
 
 async def _persona_matricula(alumno_id: int) -> Any:
-    fila = await db.alumno.find_unique(where={"id": alumno_id})
+    fila = await db.persona.find_unique(where={"id": alumno_id})
     if fila is None:
         raise HTTPException(status_code=404, detail="No está en la matrícula.")
     return fila
@@ -1060,10 +1153,10 @@ async def _asistencias_del_dia(fecha: str | None, grado: str | None) -> list[Asi
     inicio, fin, _dia = _inicio_fin_dia(fecha)
     where: dict[str, Any] = {"fechaHora": {"gte": inicio, "lte": fin}}
     if grado:
-        where["alumno"] = {"is": {"grado": grado}}
+        where["persona"] = {"is": {"detalleAlumno": {"is": {"gradoId": grado}}}}
     filas = await db.asistencia.find_many(
         where=where,
-        include={"alumno": True},
+        include={"persona": {"include": {"detalleAlumno": True}}, "dispositivo": True},
         order={"fechaHora": "asc"},
     )
     return [await _serializar_asistencia(fila) for fila in filas]
@@ -1085,7 +1178,7 @@ async def asistencia_por_fecha(
 
 @app.get("/api/catalogos/grados")
 async def get_catalogo_grados(_: Any = Depends(require_roles(*ROLES_CONSULTA))) -> list[dict[str, str]]:
-    return catalogo_grados()
+    return await catalogo_grados(db)
 
 
 @app.get("/api/dashboard")
@@ -1104,7 +1197,7 @@ async def get_asistencia_grados(
     _: Any = Depends(require_roles(*ROLES_CONSULTA)),
 ) -> dict[str, Any]:
     _inicio_fin_dia(fecha)
-    ids = {item["id"] for item in catalogo_grados()}
+    ids = {item["id"] for item in await catalogo_grados(db)}
     if gradoId not in ids:
         raise HTTPException(status_code=400, detail=f"gradoId inválido. Usa: {sorted(ids)}")
     return await armar_asistencia_grado(db, _fecha_query(fecha), gradoId)
@@ -1164,7 +1257,7 @@ async def exportar_asistencia_grados(
     _: Any = Depends(require_roles(*ROLES_EXPORTAR)),
 ) -> Response:
     dia = _fecha_query(fecha)
-    ids = {item["id"] for item in catalogo_grados()}
+    ids = {item["id"] for item in await catalogo_grados(db)}
     if gradoId not in ids:
         raise HTTPException(status_code=400, detail=f"gradoId inválido. Usa: {sorted(ids)}")
     dto = await armar_asistencia_grado(db, dia, gradoId)
