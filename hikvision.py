@@ -21,6 +21,12 @@ MINOR_TARJETA_OK = 38
 # Intentos rechazados: el aparato igual los guarda y no son asistencia.
 MINORES_FALLIDOS = {5, 6, 7, 8, 39, 74, 76, 114}
 
+# Solo estos cuentan como que la persona marcó. Es una lista cerrada a propósito:
+# el reloj reporta muchos códigos (puerta abierta, revisión remota vencida, avisos
+# del sistema) y si se aceptara todo lo que no está en MINORES_FALLIDOS, cualquier
+# código nuevo entraría al tablero como si alguien hubiera llegado.
+MINORES_ASISTENCIA = {MINOR_ROSTRO_OK, MINOR_HUELLA_OK, MINOR_TARJETA_OK}
+
 
 class HikvisionError(RuntimeError):
     pass

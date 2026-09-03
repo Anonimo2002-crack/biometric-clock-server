@@ -27,11 +27,60 @@ ROLES_SYNC = ("ADMIN", "SECRETARIA")
 ROLES_SMTP = ("ADMIN", "DIRECCION")
 ROLES_DISPOSITIVO = ("ADMIN",)
 
-JWT_SECRET = os.getenv("JWT_SECRET", "cambia-este-secreto-en-el-servidor")
+JWT_SECRET = os.getenv("JWT_SECRET", "").strip()
 JWT_HOURS = int(os.getenv("JWT_HOURS", "12"))
 ALGORITHM = "HS256"
 
+# Quien conozca el secreto puede fabricarse un token de administrador sin saber
+# ninguna clave. Por eso el sistema no arranca si quedó el de ejemplo o uno corto.
+SECRETOS_PROHIBIDOS = {"cambia-este-secreto-en-el-servidor", "dev-seminario-agua-de-la-mina"}
+if not JWT_SECRET or JWT_SECRET in SECRETOS_PROHIBIDOS or len(JWT_SECRET) < 32:
+    raise RuntimeError(
+        "JWT_SECRET falta o es débil. Poné uno largo en el .env; se genera con:\n"
+        '  python -c "import secrets; print(secrets.token_urlsafe(48))"'
+    )
+
+# Freno contra la fuerza bruta en el login.
+LOGIN_INTENTOS = int(os.getenv("LOGIN_INTENTOS", "5"))
+LOGIN_BLOQUEO = timedelta(minutes=int(os.getenv("LOGIN_BLOQUEO_MIN", "15")))
+
 _bearer = HTTPBearer(auto_error=True)
+
+# Fallos recientes por origen. Vive en memoria porque es un solo servidor en la
+# escuela; si algún día son varios, esto tendría que pasar a la base.
+_fallos: dict[str, list[datetime]] = {}
+
+
+def _vigentes(clave: str, ahora: datetime) -> list[datetime]:
+    recientes = [dato for dato in _fallos.get(clave, []) if ahora - dato < LOGIN_BLOQUEO]
+    if recientes:
+        _fallos[clave] = recientes
+    else:
+        _fallos.pop(clave, None)
+    return recientes
+
+
+def revisar_intentos(clave: str) -> None:
+    """Corta el login si ese origen ya falló demasiadas veces seguidas."""
+    ahora = datetime.now(timezone.utc)
+    recientes = _vigentes(clave, ahora)
+    if len(recientes) >= LOGIN_INTENTOS:
+        espera = LOGIN_BLOQUEO - (ahora - recientes[0])
+        minutos = max(1, int(espera.total_seconds() // 60) + 1)
+        raise HTTPException(
+            status_code=429,
+            detail=f"Demasiados intentos fallidos. Esperá {minutos} minutos y volvé a probar.",
+        )
+
+
+def anotar_fallo(clave: str) -> None:
+    ahora = datetime.now(timezone.utc)
+    _fallos.setdefault(clave, []).append(ahora)
+    _vigentes(clave, ahora)
+
+
+def limpiar_intentos(clave: str) -> None:
+    _fallos.pop(clave, None)
 
 
 def hash_password(plain: str) -> str:

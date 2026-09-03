@@ -4,12 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import os
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from datetime import datetime, timedelta, timezone
 from typing import Any, Literal
 
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from prisma.errors import UniqueViolationError
@@ -27,9 +27,12 @@ from auth import (
     ROLES_SMTP,
     ROLES_SYNC,
     ROLES_USUARIOS,
+    anotar_fallo,
     crear_token,
     hash_password,
+    limpiar_intentos,
     require_roles,
+    revisar_intentos,
     usuario_actual,
     verify_password,
 )
@@ -47,6 +50,7 @@ from hikvision import (
     MINOR_HUELLA_OK,
     MINOR_ROSTRO_OK,
     MINOR_TARJETA_OK,
+    MINORES_ASISTENCIA,
     MINORES_FALLIDOS,
     HikvisionClient,
     HikvisionError,
@@ -74,6 +78,12 @@ DEVICE_PASS = os.getenv("DEVICE_PASS", "")
 DEVICE_USER_2 = os.getenv("DEVICE_USER_2", "").strip() or DEVICE_USER
 DEVICE_PASS_2 = os.getenv("DEVICE_PASS_2", "") or DEVICE_PASS
 DEVICE_TIMEOUT = int(os.getenv("DEVICE_TIMEOUT", "10"))
+# Cada cuántos minutos bajar los marcajes solo. En 0 queda apagado y hay que
+# darle al botón del tablero.
+SYNC_AUTO_MIN = int(os.getenv("SYNC_AUTO_MIN", "10"))
+# Días que revisa la primera corrida, para recoger lo que quedó en los relojes
+# mientras el servidor estuvo apagado.
+SYNC_AUTO_DIAS = int(os.getenv("SYNC_AUTO_DIAS", "3"))
 # La captura de huella espera a que la persona ponga el dedo en el lector.
 CAPTURA_HUELLA_TIMEOUT = int(os.getenv("CAPTURA_HUELLA_TIMEOUT", "30"))
 CORS_ORIGINS = [item.strip() for item in os.getenv("CORS_ORIGINS", "*").split(",") if item.strip()]
@@ -115,9 +125,19 @@ async def _seed_admin_reloj() -> None:
         )
 
 
+# Claves que alguna vez fueron el valor de ejemplo. Si el administrador todavía
+# tiene una de estas, el sistema se la cambia solo al arrancar.
+CLAVES_DE_EJEMPLO = ("admin123", "admin", "123456", "cambiar")
+
+
 async def _seed_usuario_admin() -> None:
     usuario = os.getenv("ADMIN_USUARIO", "admin").strip() or "admin"
-    password = os.getenv("ADMIN_PASSWORD", "admin123")
+    password = os.getenv("ADMIN_PASSWORD", "").strip()
+    if len(password) < 12 or password in CLAVES_DE_EJEMPLO:
+        raise RuntimeError(
+            "ADMIN_PASSWORD falta o es muy fácil. Poné una de 12 caracteres o más en el .env."
+        )
+
     existe = await db.usuario.find_unique(where={"usuario": usuario})
     if existe is None:
         await db.usuario.create(
@@ -128,18 +148,68 @@ async def _seed_usuario_admin() -> None:
                 "rol": "ADMIN",
             }
         )
+        return
+
+    if any(verify_password(facil, existe.passwordHash) for facil in CLAVES_DE_EJEMPLO):
+        await db.usuario.update(
+            where={"id": existe.id}, data={"passwordHash": hash_password(password)}
+        )
+        print(
+            "AVISO: el administrador tenía una clave de ejemplo. "
+            "Se cambió por la de ADMIN_PASSWORD del .env."
+        )
+
+
+async def _sync_automatico() -> None:
+    """Baja los marcajes cada tanto, sin que nadie tenga que acordarse.
+
+    El reloj guarda los eventos, pero si nadie los baja no salen en el tablero.
+    La primera vuelta mira varios días atrás por si el servidor estuvo apagado.
+    """
+    primera = True
+    while True:
+        try:
+            dias = SYNC_AUTO_DIAS if primera else 1
+            hoy = datetime.now(TZ).date()
+            for atras in range(dias):
+                inicio, fin, dia = _inicio_fin_dia((hoy - timedelta(days=atras)).isoformat())
+                for ip in device_ips():
+                    resultado = await _sincronizar_ip(ip, inicio, fin, dia)
+                    if resultado.nuevos:
+                        print(f"Sync automático: {resultado.nuevos} marcaje(s) de {ip} el {dia}.")
+            primera = False
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - no debe tumbar el servidor
+            print(f"Sync automático falló: {exc}")
+        await asyncio.sleep(SYNC_AUTO_MIN * 60)
 
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    if CORS_ORIGINS == ["*"]:
+        print(
+            "AVISO: CORS_ORIGINS está en *. Cualquier página puede llamar a esta API. "
+            "Poné las direcciones reales del tablero en el .env."
+        )
     await db.connect()
     await seed_catalogos(db, device_ips())
     await _seed_admin_reloj()
     await _seed_usuario_admin()
     if os.getenv("SEED_DEMO", "").strip().lower() in {"1", "true", "yes"}:
         await seed_demo_si_vacio(db)
-    yield
-    await db.disconnect()
+
+    tarea = asyncio.create_task(_sync_automatico()) if SYNC_AUTO_MIN > 0 else None
+    if tarea is None:
+        print("AVISO: el sync automático está apagado (SYNC_AUTO_MIN=0).")
+    try:
+        yield
+    finally:
+        if tarea is not None:
+            tarea.cancel()
+            with suppress(asyncio.CancelledError):
+                await tarea
+        await db.disconnect()
 
 
 app = FastAPI(
@@ -304,16 +374,19 @@ class SyncDispositivo(BaseModel):
     nuevos: int
     duplicados: int
     sinUsuario: int
+    ignorados: int = Field(default=0, description="Eventos que no son un marcaje válido")
     error: str | None = None
 
 
 class SyncResult(BaseModel):
     fecha: str
+    dias: int = 1
     dispositivos: list[SyncDispositivo]
     consultados: int
     nuevos: int
     duplicados: int
     sinUsuario: int = Field(description="Eventos con employeeNo que no estaba en la BD")
+    ignorados: int = Field(default=0, description="Eventos que no son un marcaje válido")
 
 
 def _inicio_fin_dia(fecha: str | None) -> tuple[datetime, datetime, str]:
@@ -613,13 +686,15 @@ async def _sincronizar_ip(ip: str, inicio: datetime, fin: datetime, dia: str) ->
     nuevos = 0
     duplicados = 0
     creados_al_vuelo = 0
+    ignorados = 0
     ordenados = sorted(eventos, key=lambda item: str(item.get("time") or ""))
     for evento in ordenados:
         employee_no = str(evento.get("employeeNoString") or evento.get("employeeNo") or "").strip()
         serial = evento.get("serialNo")
         if not employee_no or serial is None:
             continue
-        if int(evento.get("minor") or 0) in MINORES_FALLIDOS:
+        if int(evento.get("minor") or 0) not in MINORES_ASISTENCIA:
+            ignorados += 1
             continue
         serial_key = f"{ip}-{serial}"
         existente = await db.asistencia.find_unique(where={"serialEvento": serial_key})
@@ -660,6 +735,7 @@ async def _sincronizar_ip(ip: str, inicio: datetime, fin: datetime, dia: str) ->
         nuevos=nuevos,
         duplicados=duplicados,
         sinUsuario=creados_al_vuelo,
+        ignorados=ignorados,
     )
 
 
@@ -702,10 +778,20 @@ async def health() -> dict[str, Any]:
 
 
 @app.post("/api/auth/login", response_model=LoginOut)
-async def login(payload: LoginIn) -> LoginOut:
-    fila = await db.usuario.find_unique(where={"usuario": payload.usuario.strip()})
+async def login(payload: LoginIn, request: Request) -> LoginOut:
+    nombre = payload.usuario.strip()
+    # Detrás del túnel todas las visitas llegan desde la misma dirección, así que
+    # el usuario también entra en la cuenta: si no, el freno no serviría de nada.
+    origen = request.client.host if request.client else "desconocido"
+    clave_intento = f"{origen}|{nombre.lower()}"
+    revisar_intentos(clave_intento)
+
+    fila = await db.usuario.find_unique(where={"usuario": nombre})
     if fila is None or not fila.activo or not verify_password(payload.password, fila.passwordHash):
+        anotar_fallo(clave_intento)
         raise HTTPException(status_code=401, detail="Usuario o contraseña incorrectos.")
+
+    limpiar_intentos(clave_intento)
     return LoginOut(
         token=crear_token(fila),
         id=fila.id,
@@ -870,7 +956,7 @@ async def get_eventos_crudos(
                 "minor": minor,
                 "veces": veces,
                 "significado": _nombre_minor(minor),
-                "seGuarda": minor not in MINORES_FALLIDOS,
+                "seGuarda": minor in MINORES_ASISTENCIA,
             }
             for minor, veces in sorted(conteo.items())
         ],
@@ -1135,17 +1221,50 @@ async def estado_biometria(
 @app.post("/api/asistencia/sincronizar", response_model=SyncResult)
 async def sincronizar_asistencia(
     fecha: str | None = Query(default=None, description="YYYY-MM-DD. Si omites, usa hoy en Guatemala."),
+    dias: int = Query(
+        default=1,
+        ge=1,
+        le=30,
+        description="Cuántos días hacia atrás recoger, contando el de la fecha.",
+    ),
     _: Any = Depends(require_roles(*ROLES_SYNC)),
 ) -> SyncResult:
-    inicio, fin, dia = _inicio_fin_dia(fecha)
-    dispositivos = [await _sincronizar_ip(ip, inicio, fin, dia) for ip in device_ips()]
+    """Baja los marcajes de los relojes.
+
+    Se puede pedir varios días para recuperar los que nadie sincronizó a tiempo:
+    el reloj guarda los eventos, pero si no se bajan no aparecen en el tablero.
+    """
+    _inicio, _fin, dia_final = _inicio_fin_dia(fecha)
+    ultimo = datetime.strptime(dia_final, "%Y-%m-%d").date()
+
+    # Un acumulado por reloj, para que el resumen no se llene de una fila por día.
+    acumulado: dict[str, SyncDispositivo] = {}
+    for atras in range(dias):
+        objetivo = (ultimo - timedelta(days=atras)).isoformat()
+        inicio, fin, dia = _inicio_fin_dia(objetivo)
+        for ip in device_ips():
+            parcial = await _sincronizar_ip(ip, inicio, fin, dia)
+            previo = acumulado.get(ip)
+            if previo is None:
+                acumulado[ip] = parcial
+                continue
+            previo.consultados += parcial.consultados
+            previo.nuevos += parcial.nuevos
+            previo.duplicados += parcial.duplicados
+            previo.sinUsuario += parcial.sinUsuario
+            previo.ignorados += parcial.ignorados
+            previo.error = previo.error or parcial.error
+
+    dispositivos = [acumulado[ip] for ip in device_ips() if ip in acumulado]
     return SyncResult(
-        fecha=dia,
+        fecha=dia_final,
+        dias=dias,
         dispositivos=dispositivos,
         consultados=sum(item.consultados for item in dispositivos),
         nuevos=sum(item.nuevos for item in dispositivos),
         duplicados=sum(item.duplicados for item in dispositivos),
         sinUsuario=sum(item.sinUsuario for item in dispositivos),
+        ignorados=sum(item.ignorados for item in dispositivos),
     )
 
 
