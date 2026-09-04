@@ -94,21 +94,29 @@ app.add_middleware(
 class AlumnoIn(BaseModel):
     nombre: str
     codigo: str
+    cui: str | None = None
     employeeNo: str
     grado: str | None = None
     cargo: str | None = None
     rol: str = "ALUMNO"
+    contactoEmergenciaNombre: str | None = None
+    contactoEmergenciaParentesco: str | None = None
+    contactoEmergenciaTelefono: str | None = None
 
 
 class AlumnoOut(BaseModel):
     id: int
     nombre: str
     codigo: str
+    cui: str | None = None
     employeeNo: str
     grado: str | None
     cargo: str | None = None
     rol: str
     activo: bool
+    contactoEmergenciaNombre: str | None = None
+    contactoEmergenciaParentesco: str | None = None
+    contactoEmergenciaTelefono: str | None = None
 
     class Config:
         from_attributes = True
@@ -267,10 +275,14 @@ async def crear_alumno(payload: AlumnoIn) -> AlumnoOut:
             data={
                 "nombre": payload.nombre.strip(),
                 "codigo": payload.codigo.strip(),
+                "cui": payload.cui.strip() if payload.cui else None,
                 "employeeNo": payload.employeeNo.strip(),
                 "grado": payload.grado,
                 "cargo": payload.cargo,
                 "rol": payload.rol.upper(),
+                "contactoEmergenciaNombre": payload.contactoEmergenciaNombre,
+                "contactoEmergenciaParentesco": payload.contactoEmergenciaParentesco,
+                "contactoEmergenciaTelefono": payload.contactoEmergenciaTelefono,
             }
         )
     except UniqueViolationError as exc:

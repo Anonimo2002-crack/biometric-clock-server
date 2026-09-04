@@ -13,16 +13,20 @@ generator client {
 
 // Alumno también cubre catedráticos y el admin del aparato (campo rol).
 model Alumno {
-  id         Int          @id @default(autoincrement())
-  nombre     String
-  codigo     String       @unique
-  employeeNo String       @unique
-  grado      String?
-  cargo      String?
-  rol        String       @default("ALUMNO")
-  activo     Boolean      @default(true)
-  creadoEn   DateTime     @default(now())
-  marcajes   Asistencia[]
+  id                           Int          @id @default(autoincrement())
+  nombre                       String
+  codigo                       String       @unique
+  cui                          String?      @unique
+  employeeNo                   String       @unique
+  grado                        String?
+  cargo                        String?
+  rol                          String       @default("ALUMNO")
+  activo                       Boolean      @default(true)
+  contactoEmergenciaNombre     String?
+  contactoEmergenciaParentesco String?
+  contactoEmergenciaTelefono   String?
+  creadoEn                     DateTime     @default(now())
+  marcajes                     Asistencia[]
 
   @@map("alumnos")
 }

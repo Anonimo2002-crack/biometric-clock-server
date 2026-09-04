@@ -17,11 +17,19 @@ HORA_LIMITE_TARDE_MAESTROS = "12:55"
 Estado = Literal["presente", "tarde", "ausente"]
 
 GRADOS: list[dict[str, str]] = [
+    {"id": "P1A", "nombre": "Párvulos 1", "seccion": "A"},
+    {"id": "P2A", "nombre": "Párvulos 2", "seccion": "A"},
+    {"id": "P2B", "nombre": "Párvulos 2", "seccion": "B"},
+    {"id": "P3A", "nombre": "Párvulos 3", "seccion": "A"},
+    {"id": "P3B", "nombre": "Párvulos 3", "seccion": "B"},
     {"id": "1A", "nombre": "1ro Primaria", "seccion": "A"},
+    {"id": "1B", "nombre": "1ro Primaria", "seccion": "B"},
     {"id": "2A", "nombre": "2do Primaria", "seccion": "A"},
     {"id": "3A", "nombre": "3ro Primaria", "seccion": "A"},
     {"id": "4A", "nombre": "4to Primaria", "seccion": "A"},
+    {"id": "4B", "nombre": "4to Primaria", "seccion": "B"},
     {"id": "5A", "nombre": "5to Primaria", "seccion": "A"},
+    {"id": "5B", "nombre": "5to Primaria", "seccion": "B"},
     {"id": "6A", "nombre": "6to Primaria", "seccion": "A"},
 ]
 

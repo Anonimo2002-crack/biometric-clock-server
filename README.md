@@ -65,6 +65,15 @@ Estados: `presente` | `tarde` | `ausente`. Tarde alumnos: después de 13:15. Tar
 
 En el client: `src/environments/environment.ts` → `useMocks: false`.
 
+## Alumnos (CUI y emergencia)
+
+Alta: `POST /api/alumnos`. Identificador único: **CUI** (`cui` y `employeeNo` = el mismo CUI para el reloj).
+
+Contacto de emergencia: `contactoEmergenciaNombre`, `contactoEmergenciaParentesco`, `contactoEmergenciaTelefono`.
+
+Grados del catálogo `GET /api/catalogos/grados`: P1A, P2A, P2B, P3A, P3B, 1A, 1B, 2A, 3A, 4A, 4B, 5A, 5B, 6A (párvulos + primaria según MINEDUC 2026).
+
+
 ## Reloj Hikvision
 
 - `POST /api/asistencia/sincronizar` baja marcajes por ISAPI y los guarda.

@@ -14,14 +14,19 @@ CREATE TABLE IF NOT EXISTS alumnos (
   id INT NOT NULL AUTO_INCREMENT,
   nombre VARCHAR(191) NOT NULL,
   codigo VARCHAR(191) NOT NULL,
-  employeeNo VARCHAR(191) NOT NULL,
-  grado VARCHAR(191) NULL COMMENT '1A..6A según catálogo del tablero',
-  cargo VARCHAR(191) NULL COMMENT 'Solo catedráticos, ej. Docente 1ro A',
+  cui VARCHAR(191) NULL COMMENT 'CUI 13 dígitos, identificador único',
+  employeeNo VARCHAR(191) NOT NULL COMMENT 'Número en el Hikvision; usar el CUI',
+  grado VARCHAR(191) NULL COMMENT 'P1A, P2A, P2B, P3A, P3B, 1A, 1B, 2A, 3A, 4A, 4B, 5A, 5B, 6A',
+  cargo VARCHAR(191) NULL COMMENT 'Solo catedráticos',
   rol VARCHAR(191) NOT NULL DEFAULT 'ALUMNO' COMMENT 'ALUMNO | CATEDRATICO | ADMIN',
   activo TINYINT(1) NOT NULL DEFAULT 1,
+  contactoEmergenciaNombre VARCHAR(191) NULL,
+  contactoEmergenciaParentesco VARCHAR(191) NULL,
+  contactoEmergenciaTelefono VARCHAR(191) NULL,
   creadoEn DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
   PRIMARY KEY (id),
   UNIQUE KEY alumnos_codigo_key (codigo),
+  UNIQUE KEY alumnos_cui_key (cui),
   UNIQUE KEY alumnos_employeeNo_key (employeeNo)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
