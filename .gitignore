@@ -10,3 +10,7 @@ __pycache__/
 .prisma/
 biometric-clock-client/
 *.log
+
+# Los respaldos llevan nombres y telefonos de los padres. No van al repositorio.
+*.sql
+dist/

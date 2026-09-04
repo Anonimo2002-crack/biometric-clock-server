@@ -14,7 +14,7 @@ pip install -r requirements.txt
 copy .env.example .env
 ```
 
-Editar `.env`: IP del reloj y la contraseña `admin` del aparato. a GitHub.**
+Editar `.env`: `DATABASE_URL` de MySQL, IP del reloj y la contraseña `admin` del aparato. **No subas el `.env` a GitHub.**
 
 ```powershell
 $env:PATH = "$(Get-Location)\venv\Scripts;" + $env:PATH
@@ -27,28 +27,15 @@ Swagger: http://127.0.0.1:8000/docs
 
 ## MySQL (PC de la escuela / Debian)
 
-En el desarrollo de Jarod la API usó **SQLite** (`asistencia.db`, no se sube a GitHub). En producción toca **MySQL**.
+La fuente de las tablas es `schema.prisma` (`Persona`, `DetalleAlumno`, `DetalleCatedratico`, `Grado`, `Dispositivo`, `Asistencia`, `Usuario`). No hay script SQL aparte: crea la base `asistencia_db` y corre `python -m prisma db push`.
 
-El diseño de tablas está en:
-
-- `schema.prisma` — modelos `Alumno` y `Asistencia`
-- [`mysql/asistencia.sql`](mysql/asistencia.sql) — `CREATE DATABASE` + `alumnos` + `asistencias`
-
-No hay tabla `usuarios` de login. Los “usuarios” del colegio son filas de `alumnos` (`rol`: `ALUMNO`, `CATEDRATICO` o `ADMIN`). El Hikvision guarda las caras aparte.
-
-En Debian:
-
-```bash
-mysql -u root -p < mysql/asistencia.sql
-```
+El `rol` de `Persona` es el del reloj (`ALUMNO`, `CATEDRATICO`, `ADMIN`). Las cuentas del tablero van en `Usuario` (login JWT). El Hikvision guarda las caras y huellas aparte.
 
 En `.env`:
 
 ```
 DATABASE_URL=mysql://USUARIO:CLAVE@127.0.0.1:3306/asistencia_db
 ```
-
-En `schema.prisma` cambia `provider = "sqlite"` por `provider = "mysql"`, luego `prisma generate` y `prisma db push` (o usa solo el `.sql` de arriba).
 
 
 ## Contrato (tablero Angular)
@@ -67,7 +54,7 @@ En el client: `src/environments/environment.ts` → `useMocks: false`.
 
 ## Alumnos (CUI y emergencia)
 
-Alta: `POST /api/alumnos`. Identificador único: **CUI** (`cui` y `employeeNo` = el mismo CUI para el reloj).
+Alta: `POST /api/alumnos`. Identificador único de alumno: **CUI** (13 dígitos). El `employeeNo` del reloj lo asigna la API.
 
 Contacto de emergencia: `contactoEmergenciaNombre`, `contactoEmergenciaParentesco`, `contactoEmergenciaTelefono`.
 

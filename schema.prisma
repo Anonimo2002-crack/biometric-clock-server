@@ -1,7 +1,6 @@
-// SQLite en la laptop. En el servidor Debian de Geovany se puede
-// cambiar a provider = "mysql" y DATABASE_URL de MySQL.
+// MySQL local (Workbench: asistencia_db). En Debian usa el mismo provider.
 datasource db {
-  provider = "sqlite"
+  provider = "mysql"
   url      = env("DATABASE_URL")
 }
 
@@ -11,38 +10,125 @@ generator client {
   interface            = "asyncio"
 }
 
-// Alumno también cubre catedráticos y el admin del aparato (campo rol).
-model Alumno {
-  id                           Int          @id @default(autoincrement())
-  nombre                       String
-  codigo                       String       @unique
-  cui                          String?      @unique
-  employeeNo                   String       @unique
-  grado                        String?
-  cargo                        String?
-  rol                          String       @default("ALUMNO")
-  activo                       Boolean      @default(true)
+// --- Personas ---
+//
+// Alumnos, catedráticos y el admin del aparato comparten lo mismo: un nombre,
+// un código y un número en el reloj. Por eso viven en una sola tabla y lo que
+// cambia entre unos y otros cuelga en las tablas de detalle.
+// Se hace así, y no con una tabla por tipo, porque los marcajes tienen que
+// apuntar a una sola tabla para no perder la integridad referencial.
+model Persona {
+  id            Int      @id @default(autoincrement())
+  nombre        String
+  // Identificador de la persona. El correlativo ALU/DOC ya no se usa: el CUI
+  // no cambia. El admin del reloj no tiene CUI y se identifica por employeeNo.
+  cui           String?  @unique
+  codigo        String   @unique
+  employeeNo    String   @unique
+  rol           String   @default("ALUMNO")
+  activo        Boolean  @default(true)
+  creadoEn      DateTime @default(now())
+  actualizadoEn DateTime @default(now()) @updatedAt
+
+  detalleAlumno      DetalleAlumno?
+  detalleCatedratico DetalleCatedratico?
+  marcajes           Asistencia[]
+
+  @@index([rol, activo])
+  @@map("personas")
+}
+
+// Lo que solo aplica a un alumno. Uno a uno con Persona.
+model DetalleAlumno {
+  personaId       Int       @id
+  gradoId         String
+  fechaNacimiento DateTime?
+  telefonoPadres               String
+  correoPadres                 String?
   contactoEmergenciaNombre     String?
   contactoEmergenciaParentesco String?
   contactoEmergenciaTelefono   String?
-  creadoEn                     DateTime     @default(now())
-  marcajes                     Asistencia[]
 
-  @@map("alumnos")
+  persona Persona @relation(fields: [personaId], references: [id], onDelete: Cascade)
+  grado   Grado   @relation(fields: [gradoId], references: [id])
+
+  @@index([gradoId])
+  @@map("alumnos_detalle")
 }
+
+// Lo que solo aplica a un catedrático. Uno a uno con Persona.
+model DetalleCatedratico {
+  personaId Int     @id
+  cargo     String
+  telefono  String
+  correo    String?
+
+  persona Persona @relation(fields: [personaId], references: [id], onDelete: Cascade)
+
+  @@map("catedraticos_detalle")
+}
+
+// --- Catálogos ---
+
+model Grado {
+  id      String  @id
+  nombre  String
+  seccion String
+  orden   Int
+  activo  Boolean @default(true)
+
+  alumnos DetalleAlumno[]
+
+  @@map("grados")
+}
+
+// Cada reloj biométrico. Antes era solo una IP suelta en el marcaje.
+model Dispositivo {
+  id        Int      @id @default(autoincrement())
+  ip        String   @unique
+  nombre    String
+  ubicacion String?
+  activo    Boolean  @default(true)
+  creadoEn  DateTime @default(now())
+
+  marcajes Asistencia[]
+
+  @@map("dispositivos")
+}
+
+// --- Movimiento ---
 
 model Asistencia {
   id            Int      @id @default(autoincrement())
-  alumnoId      Int
+  personaId     Int
+  dispositivoId Int?
   fechaHora     DateTime
   tipo          String
   metodo        String   @default("ROSTRO")
   serialEvento  String?  @unique
-  dispositivoIp String?
   creadoEn      DateTime @default(now())
-  alumno        Alumno   @relation(fields: [alumnoId], references: [id])
+
+  persona     Persona      @relation(fields: [personaId], references: [id])
+  dispositivo Dispositivo? @relation(fields: [dispositivoId], references: [id])
 
   @@index([fechaHora])
-  @@index([alumnoId, fechaHora])
+  @@index([personaId, fechaHora])
   @@map("asistencias")
+}
+
+// --- Acceso al tablero ---
+//
+// Nada que ver con el rol del reloj: aquí van las cuentas de quienes usan la
+// página web (dirección, secretaría, docentes).
+model Usuario {
+  id            Int      @id @default(autoincrement())
+  nombre        String
+  usuario       String   @unique
+  passwordHash  String
+  rol           String
+  activo        Boolean  @default(true)
+  creadoEn      DateTime @default(now())
+  actualizadoEn DateTime @default(now()) @updatedAt
+
+  @@map("usuarios")
 }
