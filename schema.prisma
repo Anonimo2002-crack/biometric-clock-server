@@ -20,6 +20,9 @@ generator client {
 model Persona {
   id            Int      @id @default(autoincrement())
   nombre        String
+  // Identificador de la persona. El correlativo ALU/DOC ya no se usa: el CUI
+  // no cambia. El admin del reloj no tiene CUI y se identifica por employeeNo.
+  cui           String?  @unique
   codigo        String   @unique
   employeeNo    String   @unique
   rol           String   @default("ALUMNO")
@@ -53,7 +56,9 @@ model DetalleAlumno {
 // Lo que solo aplica a un catedrático. Uno a uno con Persona.
 model DetalleCatedratico {
   personaId Int     @id
-  cargo     String?
+  cargo     String
+  telefono  String
+  correo    String?
 
   persona Persona @relation(fields: [personaId], references: [id], onDelete: Cascade)
 

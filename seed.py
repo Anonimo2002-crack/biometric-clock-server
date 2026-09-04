@@ -9,15 +9,23 @@ from prisma import Prisma
 
 TZ = ZoneInfo("America/Guatemala")
 
-# Los seis grados de la jornada vespertina. Se cargan una sola vez y desde ahí
-# la escuela puede editarlos en la base sin tocar el código.
+# Catálogo de la vespertina según los listados SIRE. Id corto para el API;
+# nombre y sección se muestran en el tablero.
 GRADOS: list[tuple[str, str, str, int]] = [
-    ("1A", "1ro Primaria", "A", 1),
-    ("2A", "2do Primaria", "A", 2),
-    ("3A", "3ro Primaria", "A", 3),
-    ("4A", "4to Primaria", "A", 4),
-    ("5A", "5to Primaria", "A", 5),
-    ("6A", "6to Primaria", "A", 6),
+    ("P1A", "Párvulos 1", "A", 1),
+    ("P2A", "Párvulos 2", "A", 2),
+    ("P2B", "Párvulos 2", "B", 3),
+    ("P3A", "Párvulos 3", "A", 4),
+    ("P3B", "Párvulos 3", "B", 5),
+    ("1A", "1ro Primaria", "A", 6),
+    ("1B", "1ro Primaria", "B", 7),
+    ("2A", "2do Primaria", "A", 8),
+    ("3A", "3ro Primaria", "A", 9),
+    ("4A", "4to Primaria", "A", 10),
+    ("4B", "4to Primaria", "B", 11),
+    ("5A", "5to Primaria", "A", 12),
+    ("5B", "5to Primaria", "B", 13),
+    ("6A", "6to Primaria", "A", 14),
 ]
 
 ALUMNOS: list[tuple[str, str]] = [
@@ -92,7 +100,8 @@ async def seed_demo_si_vacio(db: Prisma) -> None:
         persona = await db.persona.create(
             data={
                 "nombre": nombre,
-                "codigo": f"ALU-{grado}-{index + 1:02d}",
+                "cui": f"{3000000000000 + index}",
+                "codigo": f"{3000000000000 + index}",
                 "employeeNo": f"DEMO-A-{index + 1:02d}",
                 "rol": "ALUMNO",
                 "detalleAlumno": {
@@ -119,10 +128,13 @@ async def seed_demo_si_vacio(db: Prisma) -> None:
         persona = await db.persona.create(
             data={
                 "nombre": nombre,
-                "codigo": f"DOC-{index + 1:02d}",
+                "cui": f"{4000000000000 + index}",
+                "codigo": f"{4000000000000 + index}",
                 "employeeNo": f"DEMO-M-{index + 1:02d}",
                 "rol": "CATEDRATICO",
-                "detalleCatedratico": {"create": {"cargo": cargo}},
+                "detalleCatedratico": {
+                    "create": {"cargo": cargo, "telefono": "0000-0000"},
+                },
             }
         )
         if index == 7:

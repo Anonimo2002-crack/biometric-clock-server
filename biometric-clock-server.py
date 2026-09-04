@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 from contextlib import asynccontextmanager, suppress
 from datetime import datetime, timedelta, timezone
 from typing import Any, Literal
@@ -277,14 +278,14 @@ class ClaveIn(BaseModel):
 
 class AlumnoIn(BaseModel):
     nombre: str
-    # Si vienen vacíos, el sistema los genera solo.
-    codigo: str | None = None
-    employeeNo: str | None = None
+    cui: str | None = None
     grado: str | None = None
     cargo: str | None = None
     fechaNacimiento: str | None = Field(default=None, description="YYYY-MM-DD")
     telefonoPadres: str | None = None
     correoPadres: str | None = None
+    telefono: str | None = None
+    correo: str | None = None
     rol: str = "ALUMNO"
     activo: bool = True
 
@@ -292,6 +293,7 @@ class AlumnoIn(BaseModel):
 class AlumnoOut(BaseModel):
     id: int
     nombre: str
+    cui: str | None = None
     codigo: str
     employeeNo: str
     grado: str | None
@@ -299,6 +301,8 @@ class AlumnoOut(BaseModel):
     fechaNacimiento: datetime | None = None
     telefonoPadres: str | None = None
     correoPadres: str | None = None
+    telefono: str | None = None
+    correo: str | None = None
     rol: str
     activo: bool
 
@@ -314,6 +318,7 @@ class AsistenciaOut(BaseModel):
     id: int
     alumnoId: int
     nombre: str
+    cui: str | None = None
     codigo: str
     grado: str | None
     rol: str
@@ -478,7 +483,7 @@ def _validar_rol_sistema(rol: str) -> str:
 # choquen, y no lleva el grado adentro porque el grado cambia cada año y el
 # número tiene que seguir a la persona.
 INICIO_NUMERO = {"ALUMNO": 1000, "CATEDRATICO": 100, "ADMIN": 1}
-PREFIJO_CODIGO = {"ALUMNO": "ALU", "CATEDRATICO": "DOC", "ADMIN": "ADM"}
+CUI_RE = re.compile(r"^\d{13}$")
 
 
 async def _siguiente_employee_no(rol: str) -> str:
@@ -494,18 +499,15 @@ async def _siguiente_employee_no(rol: str) -> str:
     return str(numero)
 
 
-async def _siguiente_codigo(rol: str) -> str:
-    prefijo = PREFIJO_CODIGO.get(rol, "ALU")
-    filas = await db.persona.find_many(where={"rol": rol})
-    usados = set()
-    for fila in filas:
-        cola = fila.codigo.rsplit("-", 1)[-1]
-        if fila.codigo.startswith(f"{prefijo}-") and cola.isdigit():
-            usados.add(int(cola))
-    numero = 1
-    while numero in usados:
-        numero += 1
-    return f"{prefijo}-{numero:04d}"
+def _validar_cui(valor: str | None, *, obligatorio: bool) -> str | None:
+    texto = "".join(ch for ch in (valor or "") if ch.isdigit())
+    if not texto:
+        if obligatorio:
+            raise HTTPException(status_code=400, detail="El CUI / DPI es obligatorio (13 dígitos).")
+        return None
+    if not CUI_RE.fullmatch(texto):
+        raise HTTPException(status_code=400, detail="El CUI / DPI debe tener exactamente 13 dígitos.")
+    return texto
 
 
 def _parse_fecha_nacimiento(valor: str | None) -> datetime | None:
@@ -538,6 +540,7 @@ def _alumno_out(fila: Any) -> AlumnoOut:
     return AlumnoOut(
         id=fila.id,
         nombre=fila.nombre,
+        cui=fila.cui,
         codigo=fila.codigo,
         employeeNo=fila.employeeNo,
         grado=alumno.gradoId if alumno else None,
@@ -545,6 +548,8 @@ def _alumno_out(fila: Any) -> AlumnoOut:
         fechaNacimiento=alumno.fechaNacimiento if alumno else None,
         telefonoPadres=alumno.telefonoPadres if alumno else None,
         correoPadres=alumno.correoPadres if alumno else None,
+        telefono=catedratico.telefono if catedratico else None,
+        correo=catedratico.correo if catedratico else None,
         rol=fila.rol,
         activo=fila.activo,
     )
@@ -562,7 +567,7 @@ async def _partes_persona(
 
     if rol == "ALUMNO":
         if not grado:
-            raise HTTPException(status_code=400, detail="El alumno necesita un grado (1A a 6A).")
+            raise HTTPException(status_code=400, detail="El alumno necesita un grado del catálogo.")
         if await db.grado.find_unique(where={"id": grado}) is None:
             raise HTTPException(status_code=400, detail=f"El grado {grado} no está en el catálogo.")
         telefono = (payload.telefonoPadres or "").strip() or None
@@ -580,14 +585,26 @@ async def _partes_persona(
             "correoPadres": correo,
         }
     elif rol == "CATEDRATICO":
-        detalle_catedratico = {"cargo": (payload.cargo or "").strip() or None}
+        cargo = (payload.cargo or "").strip() or None
+        if not cargo:
+            raise HTTPException(status_code=400, detail="El maestro necesita un cargo.")
+        telefono = (payload.telefono or "").strip() or None
+        if not telefono:
+            raise HTTPException(status_code=400, detail="El teléfono del maestro es obligatorio.")
+        correo = (payload.correo or "").strip() or None
+        if correo and ("@" not in correo or "." not in correo.split("@")[-1]):
+            raise HTTPException(status_code=400, detail="Ese correo del maestro no se ve válido.")
+        detalle_catedratico = {"cargo": cargo, "telefono": telefono, "correo": correo}
 
-    codigo = (payload.codigo or "").strip() or (actual.codigo if actual else await _siguiente_codigo(rol))
-    employee_no = (payload.employeeNo or "").strip() or (
-        actual.employeeNo if actual else await _siguiente_employee_no(rol)
-    )
+    cui = _validar_cui(payload.cui, obligatorio=rol in {"ALUMNO", "CATEDRATICO"})
+    # El número del reloj no se pide: si ya existe se conserva, si es alta se asigna.
+    employee_no = actual.employeeNo if actual else await _siguiente_employee_no(rol)
+    # codigo queda igual al CUI para no romper reportes viejos; el admin del
+    # reloj sigue con ADM-001 porque no tiene CUI.
+    codigo = cui or (actual.codigo if actual else "ADM-001")
     base = {
         "nombre": payload.nombre.strip(),
+        "cui": cui,
         "codigo": codigo,
         "employeeNo": employee_no,
         "rol": rol,
@@ -611,7 +628,8 @@ async def _guardar_detalles(
             },
         )
     else:
-        await db.detallealumno.delete(where={"personaId": persona_id})
+        if await db.detallealumno.find_unique(where={"personaId": persona_id}):
+            await db.detallealumno.delete(where={"personaId": persona_id})
 
     if detalle_catedratico is not None:
         await db.detallecatedratico.upsert(
@@ -622,7 +640,8 @@ async def _guardar_detalles(
             },
         )
     else:
-        await db.detallecatedratico.delete(where={"personaId": persona_id})
+        if await db.detallecatedratico.find_unique(where={"personaId": persona_id}):
+            await db.detallecatedratico.delete(where={"personaId": persona_id})
 
 
 async def _dispositivo_id(ip: str) -> int:
@@ -657,6 +676,7 @@ async def _serializar_asistencia(row: Any) -> AsistenciaOut:
         id=row.id,
         alumnoId=row.personaId,
         nombre=persona.nombre if persona else "",
+        cui=persona.cui if persona else None,
         codigo=persona.codigo if persona else "",
         grado=detalle.gradoId if detalle else None,
         rol=persona.rol if persona else "",
@@ -1028,7 +1048,6 @@ async def siguiente_codigo(
     limpio = _validar_rol_reloj(rol)
     return {
         "rol": limpio,
-        "codigo": await _siguiente_codigo(limpio),
         "employeeNo": await _siguiente_employee_no(limpio),
     }
 
@@ -1046,7 +1065,7 @@ async def crear_alumno(
     try:
         fila = await db.persona.create(data=base, include=INCLUDE_PERSONA)
     except UniqueViolationError as exc:
-        raise HTTPException(status_code=409, detail="codigo o employeeNo ya existe") from exc
+        raise HTTPException(status_code=409, detail="Ese CUI ya está registrado.") from exc
     return _alumno_out(fila)
 
 
@@ -1063,7 +1082,7 @@ async def editar_alumno(
     try:
         await db.persona.update(where={"id": alumno_id}, data=base)
     except UniqueViolationError as exc:
-        raise HTTPException(status_code=409, detail="codigo o employeeNo ya existe") from exc
+        raise HTTPException(status_code=409, detail="Ese CUI ya está registrado.") from exc
     await _guardar_detalles(alumno_id, detalle_alumno, detalle_catedratico)
     fila = await db.persona.find_unique(where={"id": alumno_id}, include=INCLUDE_PERSONA)
     return _alumno_out(fila)
