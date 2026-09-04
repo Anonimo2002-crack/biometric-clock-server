@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import json
 import uuid
 from datetime import datetime
+from email.parser import BytesParser
+from email.policy import default as email_default
 from typing import Any
 from xml.etree import ElementTree as ET
 
@@ -55,6 +58,8 @@ class HikvisionClient:
                 timeout=timeout or self.timeout,
                 **kwargs,
             )
+        except requests.Timeout as exc:
+            raise HikvisionError(f"El reloj {self.ip} no respondió a tiempo.") from exc
         except requests.RequestException as exc:
             raise HikvisionError(f"No se pudo conectar a {self.ip}: {exc}") from exc
         return response
@@ -140,24 +145,59 @@ class HikvisionClient:
     def capture_fingerprint(self, finger_no: int = 1, timeout: int = 30) -> dict[str, Any]:
         """Prende el lector y espera a que la persona ponga el dedo.
 
-        Se queda esperando hasta `timeout` segundos, por eso no usa el timeout normal.
+        Este modelo (DS-K1T344) ignora el JSON: hay que mandar XML o responde
+        badXmlContent y el lector ni se enciende.
         """
-        respuesta = self._request(
-            "POST",
-            "/ISAPI/AccessControl/CaptureFingerPrint?format=json",
-            json={"CaptureFingerPrintCond": {"fingerNo": finger_no}},
-            timeout=timeout,
+        xml = (
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            '<CaptureFingerPrintCond version="2.0" '
+            'xmlns="http://www.isapi.org/ver20/XMLSchema">'
+            f"<fingerNo>{int(finger_no)}</fingerNo>"
+            "</CaptureFingerPrintCond>"
         )
-        cuerpo = self._json_ok(respuesta, "capturar la huella")
-        captura = cuerpo.get("CaptureFingerPrint") or {}
-        datos = str(captura.get("fingerData") or "")
-        if not datos:
-            raise HikvisionError("El lector no alcanzó a leer la huella. Intenta de nuevo.")
-        return {
-            "fingerData": datos,
-            "fingerNo": int(captura.get("fingerNo") or finger_no),
-            "calidad": int(captura.get("fingerPrintQuality") or 0),
-        }
+        try:
+            respuesta = self._request(
+                "POST",
+                "/ISAPI/AccessControl/CaptureFingerPrint",
+                data=xml.encode("utf-8"),
+                headers={"Content-Type": "application/xml"},
+                timeout=timeout,
+            )
+        except HikvisionError as exc:
+            if "no respondió a tiempo" in str(exc):
+                raise HikvisionError(
+                    "El lector se encendió, pero nadie puso el dedo a tiempo. "
+                    "Quedate frente al reloj, dale otra vez a Capturar y apoyá el dedo."
+                ) from exc
+            raise
+        return self._parse_captura(respuesta, finger_no)
+
+    def _parse_captura(self, respuesta: requests.Response, finger_no: int) -> dict[str, Any]:
+        if respuesta.status_code != 200:
+            raise HikvisionError(
+                f"capturar la huella: HTTP {respuesta.status_code} {respuesta.text[:200]}"
+            )
+        texto = respuesta.text or ""
+        tipo = (respuesta.headers.get("Content-Type") or "").lower()
+        if "json" in tipo or texto.lstrip().startswith("{"):
+            try:
+                cuerpo = self._json_ok(respuesta, "capturar la huella")
+            except HikvisionError:
+                raise
+            captura = cuerpo.get("CaptureFingerPrint") or cuerpo
+            datos = str(captura.get("fingerData") or "")
+            if datos:
+                return {
+                    "fingerData": datos,
+                    "fingerNo": int(captura.get("fingerNo") or finger_no),
+                    "calidad": int(captura.get("fingerPrintQuality") or 0),
+                }
+        parsed = _parse_captura_xml(texto)
+        if parsed:
+            if not parsed["fingerNo"]:
+                parsed["fingerNo"] = finger_no
+            return parsed
+        raise HikvisionError("El lector no alcanzó a leer la huella. Intentá de nuevo.")
 
     def save_fingerprint(self, employee_no: str, finger_no: int, finger_data: str) -> None:
         cuerpo = {
@@ -183,20 +223,186 @@ class HikvisionClient:
             f"/ISAPI/AccessControl/FingerPrint/Count?format=json&employeeNo={employee_no}",
         )
         cuerpo = self._json_ok(respuesta, f"contar huellas del {employee_no}")
+        lista = cuerpo.get("FingerPrintCountList")
+        if isinstance(lista, list) and lista:
+            primero = lista[0] or {}
+            return int(primero.get("numberOfFP") or primero.get("fingerPrintNum") or 0)
         bloque = cuerpo.get("FingerPrintCount") or cuerpo
-        return int(bloque.get("fingerPrintNum") or bloque.get("num") or 0)
+        return int(
+            bloque.get("numberOfFP") or bloque.get("fingerPrintNum") or bloque.get("num") or 0
+        )
 
     def delete_fingerprints(self, employee_no: str) -> None:
+        intentos = [
+            {"FingerPrintDelete": {"EmployeeNoDetail": {"employeeNo": employee_no}}},
+            {
+                "FingerPrintDelete": {
+                    "mode": "byEmployeeNo",
+                    "EmployeeNoList": [{"employeeNo": employee_no}],
+                }
+            },
+            {
+                "FingerPrintDelete": {
+                    "mode": "byEmployeeNo",
+                    "EmployeeNoDetail": [{"employeeNo": employee_no}],
+                }
+            },
+        ]
+        ultimo: HikvisionError | None = None
+        for cuerpo in intentos:
+            respuesta = self._request(
+                "PUT", "/ISAPI/AccessControl/FingerPrint/Delete?format=json", json=cuerpo
+            )
+            try:
+                self._json_ok(respuesta, f"borrar huellas del {employee_no}")
+                return
+            except HikvisionError as exc:
+                ultimo = exc
+        if ultimo:
+            raise ultimo
+
+    def buscar_usuario(self, employee_no: str) -> dict[str, Any] | None:
         cuerpo = {
-            "FingerPrintDelete": {
-                "mode": "byEmployeeNo",
-                "EmployeeNoDetail": [{"employeeNo": employee_no}],
+            "UserInfoSearchCond": {
+                "searchID": str(uuid.uuid4()),
+                "searchResultPosition": 0,
+                "maxResults": 1,
+                "EmployeeNoList": [{"employeeNo": employee_no}],
             }
         }
         respuesta = self._request(
-            "PUT", "/ISAPI/AccessControl/FingerPrint/Delete?format=json", json=cuerpo
+            "POST",
+            "/ISAPI/AccessControl/UserInfo/Search?format=json",
+            json=cuerpo,
         )
-        self._json_ok(respuesta, f"borrar huellas del {employee_no}")
+        if respuesta.status_code != 200:
+            raise HikvisionError(f"buscar usuario HTTP {respuesta.status_code}: {respuesta.text[:200]}")
+        bloque = (respuesta.json() or {}).get("UserInfoSearch") or {}
+        info = bloque.get("UserInfo") or []
+        if isinstance(info, dict):
+            info = [info]
+        return info[0] if info else None
+
+    def conteo_biometria(self, employee_no: str) -> dict[str, int]:
+        """Huellas y caras que el reloj ya tiene de esta persona."""
+        fila = self.buscar_usuario(employee_no)
+        if fila is None:
+            raise HikvisionError(f"El {employee_no} no está grabado en {self.ip}.")
+        return {
+            "huellas": int(fila.get("numOfFP") or 0),
+            "caras": int(fila.get("numOfFace") or 0),
+        }
+
+    def capture_face(self, timeout: int = 30) -> bytes:
+        """Prende la cámara y espera a que la persona mire al reloj."""
+        xml = (
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            '<CaptureFaceDataCond version="2.0" '
+            'xmlns="http://www.isapi.org/ver20/XMLSchema">'
+            "<captureInfrared>false</captureInfrared>"
+            "<dataType>binary</dataType>"
+            "</CaptureFaceDataCond>"
+        )
+        try:
+            respuesta = self._request(
+                "POST",
+                "/ISAPI/AccessControl/CaptureFaceData",
+                data=xml.encode("utf-8"),
+                headers={"Content-Type": "application/xml"},
+                timeout=timeout,
+            )
+        except HikvisionError as exc:
+            if "no respondió a tiempo" in str(exc):
+                raise HikvisionError(
+                    "La cámara se encendió, pero no alcanzó a tomar la cara. "
+                    "Quedate frente al reloj, dale otra vez a Capturar rostro y mirá la pantalla."
+                ) from exc
+            raise
+        return self._parse_cara(respuesta)
+
+    def save_face(self, employee_no: str, jpeg: bytes) -> None:
+        if not jpeg:
+            raise HikvisionError("No hay foto de la cara para guardar.")
+        meta = json.dumps(
+            {"faceLibType": "blackFD", "FDID": "1", "FPID": str(employee_no)},
+            separators=(",", ":"),
+        )
+        boundary = "----hikface"
+        crlf = b"\r\n"
+        partes = [
+            f"--{boundary}".encode(),
+            b'Content-Disposition: form-data; name="FaceDataRecord";',
+            b"Content-Type: application/json",
+            f"Content-Length: {len(meta.encode())}".encode(),
+            b"",
+            meta.encode(),
+            f"--{boundary}".encode(),
+            b'Content-Disposition: form-data; name="FaceImage"; filename="face.jpg"',
+            b"Content-Type: image/jpeg",
+            f"Content-Length: {len(jpeg)}".encode(),
+            b"",
+            jpeg,
+            f"--{boundary}--".encode(),
+            b"",
+        ]
+        cuerpo = crlf.join(partes)
+        respuesta = self._request(
+            "POST",
+            "/ISAPI/Intelligent/FDLib/FaceDataRecord?format=json",
+            data=cuerpo,
+            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+            timeout=max(self.timeout, 25),
+        )
+        self._json_ok(respuesta, f"guardar el rostro del {employee_no}")
+
+    def delete_face(self, employee_no: str) -> None:
+        intentos = [
+            {"FPID": [{"value": employee_no}]},
+            {"FPID": [employee_no]},
+        ]
+        ultimo: HikvisionError | None = None
+        for cuerpo in intentos:
+            respuesta = self._request(
+                "PUT",
+                "/ISAPI/Intelligent/FDLib/FDSearch/Delete?format=json&FDID=1&faceLibType=blackFD",
+                json=cuerpo,
+            )
+            try:
+                self._json_ok(respuesta, f"borrar el rostro del {employee_no}")
+                return
+            except HikvisionError as exc:
+                ultimo = exc
+        if ultimo:
+            raise ultimo
+
+    def _parse_cara(self, respuesta: requests.Response) -> bytes:
+        if respuesta.status_code != 200:
+            raise HikvisionError(
+                f"capturar el rostro: HTTP {respuesta.status_code} {respuesta.text[:200]}"
+            )
+        tipo = (respuesta.headers.get("Content-Type") or "").lower()
+        crudo = respuesta.content or b""
+        if "image/jpeg" in tipo or crudo[:2] == b"\xff\xd8":
+            return crudo
+        for parte in _partes_binarias(respuesta):
+            if parte[:2] == b"\xff\xd8":
+                return parte
+        texto = respuesta.text or ""
+        parsed = _parse_captura_xml(texto) if "<" in texto else None
+        url = ""
+        if texto:
+            try:
+                root = ET.fromstring(texto[texto.find("<") :] if "<" in texto else texto)
+                url = _xml_texto(root, "faceDataUrl") or _xml_texto(root, "faceDataURL")
+            except ET.ParseError:
+                url = ""
+        if url:
+            extra = self._request("GET", url if url.startswith("/") else f"/{url.lstrip('/')}")
+            if extra.content[:2] == b"\xff\xd8":
+                return extra.content
+        if parsed:
+            raise HikvisionError("El reloj respondió sin foto de la cara. Intentá de nuevo.")
+        raise HikvisionError("El reloj no alcanzó a tomar la cara. Intentá de nuevo.")
 
     def fetch_all_users(self, page_size: int = 30) -> list[dict[str, Any]]:
         usuarios: list[dict[str, Any]] = []
@@ -275,6 +481,56 @@ class HikvisionClient:
 
 def _local_name(tag: str) -> str:
     return tag.split("}", 1)[-1]
+
+
+def _partes_binarias(respuesta: requests.Response) -> list[bytes]:
+    tipo = respuesta.headers.get("Content-Type") or ""
+    if "multipart" not in tipo.lower():
+        return [respuesta.content] if respuesta.content else []
+    crudo = b"Content-Type: " + tipo.encode("utf-8", "replace") + b"\r\n\r\n" + (respuesta.content or b"")
+    mensaje = BytesParser(policy=email_default).parsebytes(crudo)
+    if not mensaje.is_multipart():
+        return [respuesta.content] if respuesta.content else []
+    partes: list[bytes] = []
+    for parte in mensaje.iter_parts():
+        carga = parte.get_payload(decode=True)
+        if isinstance(carga, bytes) and carga:
+            partes.append(carga)
+    return partes
+
+
+def _xml_texto(root: ET.Element, nombre: str) -> str:
+    for elem in root.iter():
+        if _local_name(elem.tag) == nombre:
+            return (elem.text or "").strip()
+    return ""
+
+
+def _parse_captura_xml(texto: str) -> dict[str, Any] | None:
+    candidato = texto
+    inicio = texto.find("<CaptureFingerPrint")
+    if inicio >= 0:
+        fin = texto.find("</CaptureFingerPrint>")
+        if fin > inicio:
+            candidato = texto[inicio : fin + len("</CaptureFingerPrint>")]
+    try:
+        root = ET.fromstring(candidato)
+    except ET.ParseError:
+        return None
+    estado = _xml_texto(root, "statusCode")
+    if estado and estado != "1":
+        detalle = _xml_texto(root, "subStatusCode") or _xml_texto(root, "statusString") or estado
+        raise HikvisionError(f"capturar la huella: el reloj respondió '{detalle}'")
+    datos = _xml_texto(root, "fingerData")
+    if not datos:
+        return None
+    calidad = _xml_texto(root, "fingerPrintQuality")
+    dedo = _xml_texto(root, "fingerNo")
+    return {
+        "fingerData": datos,
+        "fingerNo": int(dedo) if dedo.isdigit() else 0,
+        "calidad": int(calidad) if calidad.isdigit() else 0,
+    }
 
 
 def _parse_device_info(xml_text: str) -> dict[str, Any]:

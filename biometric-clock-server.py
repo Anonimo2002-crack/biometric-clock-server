@@ -366,10 +366,21 @@ class HuellaResult(BaseModel):
     dispositivos: list[RelojResultado]
 
 
+class RostroIn(BaseModel):
+    ip: str | None = Field(default=None, description="Reloj donde la persona mira a la cámara")
+
+
+class RostroResult(BaseModel):
+    employeeNo: str
+    capturadaEn: str
+    dispositivos: list[RelojResultado]
+
+
 class BiometriaReloj(BaseModel):
     dispositivoIp: str
     grabado: bool
     huellas: int
+    caras: int = 0
     detalle: str | None = None
 
 
@@ -520,12 +531,17 @@ def _parse_fecha_nacimiento(valor: str | None) -> datetime | None:
     texto = (valor or "").strip()
     if not texto:
         return None
-    try:
-        dia = datetime.strptime(texto, "%Y-%m-%d").date()
-    except ValueError as exc:
+    dia = None
+    for fmt in ("%Y-%m-%d", "%d/%m/%Y"):
+        try:
+            dia = datetime.strptime(texto, fmt).date()
+            break
+        except ValueError:
+            continue
+    if dia is None:
         raise HTTPException(
-            status_code=400, detail="La fecha de nacimiento va como AAAA-MM-DD."
-        ) from exc
+            status_code=400, detail="La fecha de nacimiento va como dd/mm/aaaa, por ejemplo 15/03/2018."
+        )
     if dia > datetime.now(TZ).date():
         raise HTTPException(status_code=400, detail="La fecha de nacimiento no puede ser futura.")
     return datetime(dia.year, dia.month, dia.day)
@@ -1210,6 +1226,56 @@ async def capturar_huella(
     )
 
 
+@app.post("/api/alumnos/{alumno_id}/rostro", response_model=RostroResult)
+async def capturar_rostro(
+    alumno_id: int,
+    payload: RostroIn,
+    _: Any = Depends(require_roles(*ROLES_MATRICULA_ESCRIBIR)),
+) -> RostroResult:
+    """Prende la cámara, espera la cara y la copia a todos los relojes."""
+    persona = await _persona_matricula(alumno_id)
+    lector = payload.ip or device_ips()[0]
+    if lector not in device_ips():
+        raise HTTPException(status_code=400, detail=f"El reloj {lector} no está configurado.")
+
+    try:
+        foto = await asyncio.to_thread(
+            hikvision(lector).capture_face, CAPTURA_HUELLA_TIMEOUT
+        )
+    except HikvisionError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    def guardar(ip: str) -> None:
+        hikvision(ip).save_face(persona.employeeNo, foto)
+
+    dispositivos = await _en_cada_reloj(guardar)
+    if not any(item.ok for item in dispositivos):
+        detalle = dispositivos[0].detalle if dispositivos else "No hay relojes configurados."
+        raise HTTPException(status_code=502, detail=f"Se tomó la cara pero no se guardó: {detalle}")
+    return RostroResult(
+        employeeNo=persona.employeeNo,
+        capturadaEn=lector,
+        dispositivos=dispositivos,
+    )
+
+
+@app.delete("/api/alumnos/{alumno_id}/rostro", response_model=EnrolarResult)
+async def borrar_rostros(
+    alumno_id: int,
+    _: Any = Depends(require_roles(*ROLES_MATRICULA_ESCRIBIR)),
+) -> EnrolarResult:
+    persona = await _persona_matricula(alumno_id)
+
+    def borrar(ip: str) -> None:
+        hikvision(ip).delete_face(persona.employeeNo)
+
+    return EnrolarResult(
+        employeeNo=persona.employeeNo,
+        nombre=persona.nombre,
+        dispositivos=await _en_cada_reloj(borrar),
+    )
+
+
 @app.delete("/api/alumnos/{alumno_id}/huella", response_model=EnrolarResult)
 async def borrar_huellas(
     alumno_id: int,
@@ -1237,11 +1303,20 @@ async def estado_biometria(
     relojes: list[BiometriaReloj] = []
     for ip in device_ips():
         try:
-            huellas = await asyncio.to_thread(hikvision(ip).count_fingerprints, persona.employeeNo)
-            relojes.append(BiometriaReloj(dispositivoIp=ip, grabado=True, huellas=huellas))
+            conteo = await asyncio.to_thread(hikvision(ip).conteo_biometria, persona.employeeNo)
+            relojes.append(
+                BiometriaReloj(
+                    dispositivoIp=ip,
+                    grabado=True,
+                    huellas=conteo["huellas"],
+                    caras=conteo["caras"],
+                )
+            )
         except HikvisionError as exc:
             relojes.append(
-                BiometriaReloj(dispositivoIp=ip, grabado=False, huellas=0, detalle=str(exc))
+                BiometriaReloj(
+                    dispositivoIp=ip, grabado=False, huellas=0, caras=0, detalle=str(exc)
+                )
             )
     return BiometriaOut(employeeNo=persona.employeeNo, nombre=persona.nombre, relojes=relojes)
 
@@ -1461,6 +1536,12 @@ async def exportar_maestros(
         encabezados,
         filas,
     )
+
+
+@app.get("/api/reportes/correo")
+async def estado_correo(_: Any = Depends(require_roles(*ROLES_CONSULTA))) -> dict[str, Any]:
+    destino = os.getenv("SMTP_TO", "").strip()
+    return {"configurado": smtp_configurado(), "destino": destino or None}
 
 
 @app.post("/api/reportes/ausencias/enviar-correo")

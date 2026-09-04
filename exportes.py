@@ -19,6 +19,18 @@ from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, Tabl
 
 from reportes import INSTITUCION, JORNADA
 
+_ESTADO = {"presente": "Presente", "tarde": "Tarde", "ausente": "Ausente"}
+
+
+def _fecha_gt(iso: str) -> str:
+    if len(iso) >= 10 and iso[4] == "-" and iso[7] == "-":
+        return f"{iso[8:10]}/{iso[5:7]}/{iso[0:4]}"
+    return iso
+
+
+def _estado(valor: str) -> str:
+    return _ESTADO.get(valor, valor)
+
 _FONT_NAME = "Helvetica"
 _FONT_BOLD = "Helvetica-Bold"
 
@@ -109,7 +121,7 @@ def armar_pdf(titulo: str, subtitulo: str, encabezados: list[str], filas: list[l
     story: list[Any] = [
         Paragraph(INSTITUCION, estilos["kicker"]),
         Paragraph(titulo, estilos["titulo"]),
-        Paragraph(f"{JORNADA} · {subtitulo}", estilos["meta"]),
+        Paragraph(f"{JORNADA} · {_fecha_gt(subtitulo) if len(subtitulo) == 10 else subtitulo}", estilos["meta"]),
         Spacer(1, 6),
     ]
     datos = [encabezados, *[[("" if cell is None else str(cell)) for cell in fila] for fila in filas]]
@@ -148,7 +160,7 @@ def armar_excel(titulo: str, subtitulo: str, encabezados: list[str], filas: list
     hoja["A1"].font = Font(bold=True, color="1B2A24", size=14)
     hoja["A2"] = titulo
     hoja["A2"].font = Font(bold=True, size=12)
-    hoja["A3"] = f"{JORNADA} · {subtitulo}"
+    hoja["A3"] = f"{JORNADA} · {_fecha_gt(subtitulo) if len(subtitulo) == 10 else subtitulo}"
     hoja["A3"].font = Font(italic=True, color="6B5F52")
 
     for col, texto in enumerate(encabezados, start=1):
@@ -194,7 +206,7 @@ def dashboard_filas(dto: dict[str, Any]) -> tuple[list[str], list[list[Any]]]:
 def asistencia_filas(dto: dict[str, Any]) -> tuple[list[str], list[list[Any]]]:
     encabezados = ["Alumno", "Grado", "Hora de marca", "Estado"]
     filas = [
-        [item["nombre"], item["grado"], item.get("horaMarca") or "Sin marca", item["estado"]]
+        [item["nombre"], item["grado"], item.get("horaMarca") or "Sin marca", _estado(item["estado"])]
         for item in dto.get("alumnos") or []
     ]
     return encabezados, filas
@@ -203,7 +215,7 @@ def asistencia_filas(dto: dict[str, Any]) -> tuple[list[str], list[list[Any]]]:
 def ausencias_filas(dto: dict[str, Any]) -> tuple[list[str], list[list[Any]]]:
     encabezados = ["Alumno", "Grado", "Marca", "Estado"]
     filas = [
-        [item["nombre"], item["grado"], item.get("horaMarca") or "Sin marca", item["estado"]]
+        [item["nombre"], item["grado"], item.get("horaMarca") or "Sin marca", _estado(item["estado"])]
         for item in dto.get("alumnos") or []
     ]
     return encabezados, filas
@@ -217,7 +229,7 @@ def maestros_filas(dto: dict[str, Any]) -> tuple[list[str], list[list[Any]]]:
             item.get("cargo") or "",
             item.get("horaEntrada") or "—",
             item.get("horaSalida") or "—",
-            item["estado"],
+            _estado(item["estado"]),
         ]
         for item in dto.get("maestros") or []
     ]
