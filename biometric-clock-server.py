@@ -1750,8 +1750,12 @@ async def exportar_maestros(
 
 @app.get("/api/reportes/correo")
 async def estado_correo(_: Any = Depends(require_roles(*ROLES_CONSULTA))) -> dict[str, Any]:
-    destino = os.getenv("SMTP_TO", "").strip()
-    return {"configurado": smtp_configurado(), "destino": destino or None}
+    remitente = os.getenv("SMTP_FROM", "").strip() or os.getenv("SMTP_USER", "").strip()
+    return {
+        "configurado": smtp_configurado(),
+        "destino": "el correo de los padres de cada alumno",
+        "remitente": remitente or None,
+    }
 
 
 @app.post("/api/reportes/ausencias/enviar-correo")
@@ -1763,16 +1767,22 @@ async def correo_ausencias(
     if not smtp_configurado():
         raise HTTPException(
             status_code=503,
-            detail="SMTP no está configurado. Completa SMTP_HOST y SMTP_TO en el .env",
+            detail="SMTP no está configurado. Completa SMTP_HOST, SMTP_USER y SMTP_PASSWORD en el .env",
         )
     if horaCorte not in HORAS_CORTE_VALIDAS:
         raise HTTPException(status_code=400, detail="horaCorte inválida")
     dto = await armar_ausencias(db, _fecha_query(fecha), horaCorte)
     try:
-        destino = enviar_ausencias(dto)
+        resultado = enviar_ausencias(dto)
     except CorreoError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
-    return {"ok": True, "destinatario": destino, "totalAusentes": dto["totalAusentes"]}
+    return {
+        "ok": True,
+        "destinatario": resultado["destinatario"],
+        "totalAusentes": dto["totalAusentes"],
+        "enviados": resultado["enviados"],
+        "sinCorreo": resultado["sinCorreo"],
+    }
 
 
 if __name__ == "__main__":

@@ -133,6 +133,7 @@ def _alumno_asistencia(
     grado_id, grado_texto = _grado_de(persona)
     entrada = _primera_entrada(persona.marcajes or [], inicio, fin)
     hora_marca = _hora_hhmm(entrada) if entrada else None
+    detalle = getattr(persona, "detalleAlumno", None)
     return {
         "id": str(persona.id),
         "nombre": persona.nombre,
@@ -140,6 +141,7 @@ def _alumno_asistencia(
         "employeeNo": persona.employeeNo,
         "gradoId": grado_id,
         "grado": grado_texto,
+        "correoPadres": getattr(detalle, "correoPadres", None) if detalle else None,
         "horaMarca": hora_marca,
         "estado": estado_por_hora(hora_marca, HORA_LIMITE_TARDE_ALUMNOS, hora_corte),
     }
