@@ -429,6 +429,15 @@ class EnrolarResult(BaseModel):
     dispositivos: list[RelojResultado]
 
 
+class BajaResult(EnrolarResult):
+    id: int
+    activo: bool
+
+
+class ReactivarIn(BaseModel):
+    grado: str | None = None
+
+
 class HuellaIn(BaseModel):
     dedo: int = 1
     ip: str | None = Field(default=None, description="Reloj donde la persona pone el dedo")
@@ -605,20 +614,27 @@ def _validar_rol_sistema(rol: str) -> str:
 # Numeración del reloj. Va aparte por rol para que alumnos y personal no
 # choquen, y no lleva el grado adentro porque el grado cambia cada año y el
 # número tiene que seguir a la persona.
+# Admin 1–99, maestros 100–999, alumnos 1000 en adelante.
 INICIO_NUMERO = {"ALUMNO": 1000, "CATEDRATICO": 100, "ADMIN": 1}
+TOPE_NUMERO = {"CATEDRATICO": 999, "ADMIN": 99}
 CUI_RE = re.compile(r"^\d{13}$")
+TELEFONO_RE = re.compile(r"^\d{8}$")
+CORREO_RE = re.compile(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$")
 
 
 async def _siguiente_employee_no(rol: str) -> str:
     desde = INICIO_NUMERO.get(rol, 1000)
+    tope = TOPE_NUMERO.get(rol)
     filas = await db.persona.find_many()
-    usados = set()
-    for fila in filas:
-        if fila.employeeNo.isdigit():
-            usados.add(int(fila.employeeNo))
+    usados = {int(fila.employeeNo) for fila in filas if fila.employeeNo.isdigit()}
     numero = desde
     while numero in usados:
         numero += 1
+        if tope is not None and numero > tope:
+            raise HTTPException(
+                status_code=400,
+                detail="Ya no hay números de reloj libres para ese rol. Los maestros van del 100 al 999 y los alumnos del 1000 en adelante.",
+            )
     return str(numero)
 
 
@@ -630,6 +646,26 @@ def _validar_cui(valor: str | None, *, obligatorio: bool) -> str | None:
         return None
     if not CUI_RE.fullmatch(texto):
         raise HTTPException(status_code=400, detail="El CUI / DPI debe tener exactamente 13 dígitos.")
+    return texto
+
+
+def _validar_telefono(valor: str | None, *, etiqueta: str, obligatorio: bool = True) -> str:
+    digitos = "".join(ch for ch in (valor or "") if ch.isdigit())
+    if not digitos:
+        if obligatorio:
+            raise HTTPException(status_code=400, detail=f"{etiqueta} es obligatorio (8 números).")
+        return ""
+    if not TELEFONO_RE.fullmatch(digitos):
+        raise HTTPException(status_code=400, detail=f"{etiqueta} debe tener exactamente 8 números.")
+    return digitos
+
+
+def _validar_correo(valor: str | None) -> str | None:
+    texto = (valor or "").strip()
+    if not texto:
+        return None
+    if not CORREO_RE.fullmatch(texto):
+        raise HTTPException(status_code=400, detail="Ese correo no es válido. Ejemplo: padre@gmail.com")
     return texto
 
 
@@ -701,14 +737,10 @@ async def _partes_persona(
             raise HTTPException(status_code=400, detail="El alumno necesita un grado del catálogo.")
         if await db.grado.find_unique(where={"id": grado}) is None:
             raise HTTPException(status_code=400, detail=f"El grado {grado} no está en el catálogo.")
-        telefono = (payload.telefonoPadres or "").strip() or None
-        if not telefono:
-            raise HTTPException(
-                status_code=400, detail="El teléfono de los padres es obligatorio para el alumno."
-            )
-        correo = (payload.correoPadres or "").strip() or None
-        if correo and ("@" not in correo or "." not in correo.split("@")[-1]):
-            raise HTTPException(status_code=400, detail="Ese correo de los padres no se ve válido.")
+        telefono = _validar_telefono(
+            payload.telefonoPadres, etiqueta="El teléfono de los padres", obligatorio=False
+        )
+        correo = _validar_correo(payload.correoPadres)
         detalle_alumno = {
             "gradoId": grado,
             "fechaNacimiento": _parse_fecha_nacimiento(payload.fechaNacimiento),
@@ -719,12 +751,8 @@ async def _partes_persona(
         cargo = (payload.cargo or "").strip() or None
         if not cargo:
             raise HTTPException(status_code=400, detail="El maestro necesita un cargo.")
-        telefono = (payload.telefono or "").strip() or None
-        if not telefono:
-            raise HTTPException(status_code=400, detail="El teléfono del maestro es obligatorio.")
-        correo = (payload.correo or "").strip() or None
-        if correo and ("@" not in correo or "." not in correo.split("@")[-1]):
-            raise HTTPException(status_code=400, detail="Ese correo del maestro no se ve válido.")
+        telefono = _validar_telefono(payload.telefono, etiqueta="El teléfono del maestro")
+        correo = _validar_correo(payload.correo)
         detalle_catedratico = {"cargo": cargo, "telefono": telefono, "correo": correo}
 
     cui = _validar_cui(payload.cui, obligatorio=rol in {"ALUMNO", "CATEDRATICO"})
@@ -1367,11 +1395,25 @@ async def editar_alumno(
     return _alumno_out(fila)
 
 
-@app.delete("/api/alumnos/{alumno_id}", response_model=AlumnoOut)
+def _borrar_biometricos_reloj(ip: str, employee_no: str) -> None:
+    """Saca huella, cara y usuario para que el cupo del aparato quede libre."""
+    cliente = hikvision(ip)
+    if cliente.buscar_usuario(employee_no) is None:
+        return
+    for accion in (cliente.delete_face, cliente.delete_fingerprints, cliente.delete_user):
+        try:
+            accion(employee_no)
+        except HikvisionError:
+            continue
+    if cliente.buscar_usuario(employee_no) is not None:
+        raise HikvisionError(f"El {employee_no} sigue en {ip} después de borrar.")
+
+
+@app.delete("/api/alumnos/{alumno_id}", response_model=BajaResult)
 async def baja_alumno(
     alumno_id: int,
     _: Any = Depends(require_roles(*ROLES_MATRICULA_ESCRIBIR)),
-) -> AlumnoOut:
+) -> BajaResult:
     actual = await db.persona.find_unique(where={"id": alumno_id})
     if actual is None:
         raise HTTPException(status_code=404, detail="No está en la matrícula.")
@@ -1379,12 +1421,37 @@ async def baja_alumno(
         where={"id": alumno_id}, data={"activo": False}, include=INCLUDE_PERSONA
     )
 
-    # Quien ya no está en la matrícula tampoco debe poder marcar en el reloj.
-    # Si el reloj no contesta, la baja en la BD igual queda hecha.
-    def quitar(ip: str) -> None:
-        hikvision(ip).delete_user(actual.employeeNo)
+    # La ficha y los marcajes se quedan. En el reloj se borra todo para no
+    # dejar el cupo ocupado. Si un aparato no contesta, la baja en la BD igual.
+    dispositivos = await _en_cada_reloj(
+        lambda ip: _borrar_biometricos_reloj(ip, actual.employeeNo)
+    )
+    return BajaResult(
+        id=fila.id,
+        employeeNo=fila.employeeNo,
+        nombre=fila.nombre,
+        activo=fila.activo,
+        dispositivos=dispositivos,
+    )
 
-    await _en_cada_reloj(quitar)
+
+@app.post("/api/alumnos/{alumno_id}/reactivar", response_model=AlumnoOut)
+async def reactivar_alumno(
+    alumno_id: int,
+    payload: ReactivarIn,
+    _: Any = Depends(require_roles(*ROLES_MATRICULA_ESCRIBIR)),
+) -> AlumnoOut:
+    actual = await db.persona.find_unique(where={"id": alumno_id}, include=INCLUDE_PERSONA)
+    if actual is None:
+        raise HTTPException(status_code=404, detail="No está en la matrícula.")
+    grado = (payload.grado or "").strip() or None
+    if actual.rol == "ALUMNO" and grado:
+        if await db.grado.find_unique(where={"id": grado}) is None:
+            raise HTTPException(status_code=400, detail=f"El grado {grado} no está en el catálogo.")
+        await db.detallealumno.update(where={"personaId": alumno_id}, data={"gradoId": grado})
+    fila = await db.persona.update(
+        where={"id": alumno_id}, data={"activo": True}, include=INCLUDE_PERSONA
+    )
     return _alumno_out(fila)
 
 
