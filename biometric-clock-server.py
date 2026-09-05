@@ -22,6 +22,7 @@ from auth import (
     ROLES_CONSULTA,
     ROLES_DISPOSITIVO,
     ROLES_EXPORTAR,
+    ROLES_MARCAR,
     ROLES_MATRICULA_ESCRIBIR,
     ROLES_MATRICULA_VER,
     ROLES_SISTEMA,
@@ -43,11 +44,13 @@ from exportes import (
     armar_excel,
     armar_pdf,
     asistencia_filas,
+    asistencia_secciones_filas,
     ausencias_filas,
     dashboard_filas,
     maestros_filas,
 )
 from hikvision import (
+    MINOR_CLAVE_OK,
     MINOR_HUELLA_OK,
     MINOR_ROSTRO_OK,
     MINOR_TARJETA_OK,
@@ -57,11 +60,15 @@ from hikvision import (
     HikvisionError,
 )
 from reportes import (
+    HORA_LIMITE_TARDE_ALUMNOS,
+    HORA_LIMITE_TARDE_MAESTROS,
     armar_asistencia_grado,
+    armar_asistencia_secciones,
     armar_ausencias,
     armar_dashboard,
     armar_maestros,
     catalogo_grados,
+    estado_por_hora,
 )
 from seed import seed_catalogos, seed_demo_si_vacio
 from zoneinfo import ZoneInfo
@@ -326,6 +333,7 @@ class AsistenciaOut(BaseModel):
     nombre: str
     cui: str | None = None
     codigo: str
+    employeeNo: str | None = None
     grado: str | None
     rol: str
     fechaHora: datetime
@@ -411,6 +419,33 @@ class SyncResult(BaseModel):
     ignorados: int = Field(default=0, description="Eventos que no son un marcaje válido")
 
 
+class MarcaCodigoIn(BaseModel):
+    codigo: str
+    tipo: Literal["ENTRADA", "SALIDA"] | None = None
+
+
+class PersonaCodigoOut(BaseModel):
+    id: int
+    nombre: str
+    cui: str | None
+    employeeNo: str
+    codigo: str
+    rol: str
+    grado: str | None
+    cargo: str | None
+    horaMarca: str | None
+    estado: str
+    yaMarco: bool
+    proximoTipo: str
+
+
+class MarcaCodigoOut(PersonaCodigoOut):
+    marcaId: int
+    tipo: str
+    hora: str
+    metodo: str
+
+
 def _inicio_fin_dia(fecha: str | None) -> tuple[datetime, datetime, str]:
     if fecha:
         try:
@@ -433,6 +468,7 @@ def _nombre_minor(minor: int) -> str:
         MINOR_ROSTRO_OK: "rostro reconocido",
         MINOR_HUELLA_OK: "huella reconocida",
         MINOR_TARJETA_OK: "tarjeta aceptada",
+        MINOR_CLAVE_OK: "código en el teclado",
         27: "botón de salida",
     }
     if minor in conocidos:
@@ -452,6 +488,8 @@ def _metodo_evento(evento: dict[str, Any]) -> str:
         return "HUELLA"
     if minor == MINOR_TARJETA_OK:
         return "TARJETA"
+    if minor == MINOR_CLAVE_OK:
+        return "CLAVE"
 
     modo = str(evento.get("currentVerifyMode") or "").lower()
     if "or" not in modo:
@@ -574,9 +612,9 @@ def _alumno_out(fila: Any) -> AlumnoOut:
         correo=catedratico.correo if catedratico else None,
         rol=fila.rol,
         activo=fila.activo,
-        contactoEmergenciaNombre=alumno.contactoEmergenciaNombre if alumno else None,
-        contactoEmergenciaParentesco=alumno.contactoEmergenciaParentesco if alumno else None,
-        contactoEmergenciaTelefono=alumno.contactoEmergenciaTelefono if alumno else None,
+        contactoEmergenciaNombre=getattr(alumno, "contactoEmergenciaNombre", None) if alumno else None,
+        contactoEmergenciaParentesco=getattr(alumno, "contactoEmergenciaParentesco", None) if alumno else None,
+        contactoEmergenciaTelefono=getattr(alumno, "contactoEmergenciaTelefono", None) if alumno else None,
     )
 
 
@@ -608,9 +646,6 @@ async def _partes_persona(
             "fechaNacimiento": _parse_fecha_nacimiento(payload.fechaNacimiento),
             "telefonoPadres": telefono,
             "correoPadres": correo,
-            "contactoEmergenciaNombre": (payload.contactoEmergenciaNombre or "").strip() or None,
-            "contactoEmergenciaParentesco": (payload.contactoEmergenciaParentesco or "").strip() or None,
-            "contactoEmergenciaTelefono": (payload.contactoEmergenciaTelefono or "").strip() or None,
         }
     elif rol == "CATEDRATICO":
         cargo = (payload.cargo or "").strip() or None
@@ -696,6 +731,80 @@ async def _siguiente_tipo(persona_id: int, cuando: datetime) -> str:
     return "SALIDA"
 
 
+def _limpiar_codigo(valor: str) -> str:
+    return "".join((valor or "").strip().split())
+
+
+async def _persona_por_codigo(codigo: str) -> Any:
+    limpio = _limpiar_codigo(codigo)
+    if not limpio:
+        raise HTTPException(status_code=400, detail="Escribí el CUI o el número de reloj.")
+
+    persona = await db.persona.find_first(
+        where={
+            "activo": True,
+            "OR": [
+                {"cui": limpio},
+                {"employeeNo": limpio},
+                {"codigo": limpio},
+            ],
+        },
+        include=INCLUDE_PERSONA,
+    )
+    if persona is None and limpio.isdigit():
+        persona = await db.persona.find_first(
+            where={"activo": True, "employeeNo": str(int(limpio))},
+            include=INCLUDE_PERSONA,
+        )
+    if persona is None:
+        raise HTTPException(status_code=404, detail="No hay nadie con ese código en la matrícula.")
+    return persona
+
+
+def _hora_local(valor: datetime) -> str:
+    if valor.tzinfo is None:
+        valor = valor.replace(tzinfo=timezone.utc)
+    return valor.astimezone(TZ).strftime("%H:%M")
+
+
+async def _ficha_codigo(persona: Any) -> PersonaCodigoOut:
+    inicio, fin, _dia = _inicio_fin_dia(None)
+    entrada = await db.asistencia.find_first(
+        where={
+            "personaId": persona.id,
+            "tipo": "ENTRADA",
+            "fechaHora": {"gte": inicio, "lte": fin},
+        },
+        order={"fechaHora": "asc"},
+    )
+    hora_marca = _hora_local(entrada.fechaHora) if entrada else None
+    limite = HORA_LIMITE_TARDE_ALUMNOS if persona.rol == "ALUMNO" else HORA_LIMITE_TARDE_MAESTROS
+    alumno = getattr(persona, "detalleAlumno", None)
+    catedratico = getattr(persona, "detalleCatedratico", None)
+    grado = None
+    if alumno is not None:
+        fila_grado = getattr(alumno, "grado", None)
+        grado = (
+            f"{fila_grado.nombre.replace(' Primaria', '')} {fila_grado.seccion}"
+            if fila_grado
+            else alumno.gradoId
+        )
+    return PersonaCodigoOut(
+        id=persona.id,
+        nombre=persona.nombre,
+        cui=persona.cui,
+        employeeNo=persona.employeeNo,
+        codigo=persona.codigo,
+        rol=persona.rol,
+        grado=grado,
+        cargo=catedratico.cargo if catedratico else None,
+        horaMarca=hora_marca,
+        estado=estado_por_hora(hora_marca, limite),
+        yaMarco=entrada is not None,
+        proximoTipo=await _siguiente_tipo(persona.id, datetime.now(TZ)),
+    )
+
+
 async def _serializar_asistencia(row: Any) -> AsistenciaOut:
     persona = row.persona
     detalle = getattr(persona, "detalleAlumno", None) if persona else None
@@ -706,6 +815,7 @@ async def _serializar_asistencia(row: Any) -> AsistenciaOut:
         nombre=persona.nombre if persona else "",
         cui=persona.cui if persona else None,
         codigo=persona.codigo if persona else "",
+        employeeNo=persona.employeeNo if persona else None,
         grado=detalle.gradoId if detalle else None,
         rol=persona.rol if persona else "",
         fechaHora=row.fechaHora,
@@ -1401,6 +1511,78 @@ async def asistencia_por_fecha(
     return await _asistencias_del_dia(fecha, grado)
 
 
+@app.get("/api/asistencia/buscar", response_model=PersonaCodigoOut)
+async def buscar_por_codigo(
+    codigo: str = Query(..., min_length=1),
+    _: Any = Depends(require_roles(*ROLES_MARCAR)),
+) -> PersonaCodigoOut:
+    return await _ficha_codigo(await _persona_por_codigo(codigo))
+
+
+@app.post("/api/asistencia/por-codigo", response_model=MarcaCodigoOut)
+async def marcar_por_codigo(
+    payload: MarcaCodigoIn,
+    _: Any = Depends(require_roles(*ROLES_MARCAR)),
+) -> MarcaCodigoOut:
+    persona = await _persona_por_codigo(payload.codigo)
+    cuando = datetime.now(TZ)
+    tipo = (payload.tipo or "").strip().upper() or None
+    if tipo not in {None, "ENTRADA", "SALIDA"}:
+        raise HTTPException(status_code=400, detail="tipo: ENTRADA o SALIDA")
+
+    ficha = await _ficha_codigo(persona)
+    if tipo is None:
+        if ficha.yaMarco:
+            raise HTTPException(
+                status_code=409,
+                detail=f"{persona.nombre} ya marcó entrada a las {ficha.horaMarca}.",
+            )
+        tipo = "ENTRADA"
+    elif tipo == "ENTRADA" and ficha.yaMarco:
+        raise HTTPException(
+            status_code=409,
+            detail=f"{persona.nombre} ya marcó entrada a las {ficha.horaMarca}.",
+        )
+
+    serial = f"CODIGO-{persona.id}-{cuando.strftime('%Y%m%d%H%M%S%f')}"
+    fila = await db.asistencia.create(
+        data={
+            "personaId": persona.id,
+            "fechaHora": cuando,
+            "tipo": tipo,
+            "metodo": "CODIGO",
+            "serialEvento": serial,
+        },
+        include={"persona": {"include": INCLUDE_PERSONA}, "dispositivo": True},
+    )
+    actualizada = await _ficha_codigo(persona)
+    return MarcaCodigoOut(
+        **actualizada.model_dump(),
+        marcaId=fila.id,
+        tipo=fila.tipo,
+        hora=_hora_local(fila.fechaHora),
+        metodo=fila.metodo,
+    )
+
+
+@app.get("/api/asistencia/por-codigo/recientes", response_model=list[AsistenciaOut])
+async def recientes_por_codigo(
+    fecha: str | None = Query(default=None),
+    _: Any = Depends(require_roles(*ROLES_MARCAR)),
+) -> list[AsistenciaOut]:
+    inicio, fin, _dia = _inicio_fin_dia(fecha)
+    filas = await db.asistencia.find_many(
+        where={
+            "metodo": "CODIGO",
+            "fechaHora": {"gte": inicio, "lte": fin},
+        },
+        include={"persona": {"include": {"detalleAlumno": True}}, "dispositivo": True},
+        order={"fechaHora": "desc"},
+        take=20,
+    )
+    return [await _serializar_asistencia(fila) for fila in filas]
+
+
 @app.get("/api/catalogos/grados")
 async def get_catalogo_grados(_: Any = Depends(require_roles(*ROLES_CONSULTA))) -> list[dict[str, str]]:
     return await catalogo_grados(db)
@@ -1426,6 +1608,15 @@ async def get_asistencia_grados(
     if gradoId not in ids:
         raise HTTPException(status_code=400, detail=f"gradoId inválido. Usa: {sorted(ids)}")
     return await armar_asistencia_grado(db, _fecha_query(fecha), gradoId)
+
+
+@app.get("/api/reportes/asistencia-secciones")
+async def get_asistencia_secciones(
+    fecha: str | None = Query(default=None, description="YYYY-MM-DD"),
+    _: Any = Depends(require_roles(*ROLES_CONSULTA)),
+) -> dict[str, Any]:
+    _inicio_fin_dia(fecha)
+    return await armar_asistencia_secciones(db, _fecha_query(fecha))
 
 
 @app.get("/api/reportes/ausencias")
@@ -1490,7 +1681,26 @@ async def exportar_asistencia_grados(
     return _archivo_reporte(
         formato,
         f"asistencia-{gradoId}-{dia}",
-        f"Asistencia {dto['grado']}",
+        f"Reporte {dto['grado']}",
+        dia,
+        encabezados,
+        filas,
+    )
+
+
+@app.get("/api/exportar/asistencia-secciones")
+async def exportar_asistencia_secciones(
+    fecha: str | None = Query(default=None),
+    formato: Literal["pdf", "xlsx"] = "pdf",
+    _: Any = Depends(require_roles(*ROLES_EXPORTAR)),
+) -> Response:
+    dia = _fecha_query(fecha)
+    dto = await armar_asistencia_secciones(db, dia)
+    encabezados, filas = asistencia_secciones_filas(dto)
+    return _archivo_reporte(
+        formato,
+        f"asistencia-secciones-{dia}",
+        "Reporte de asistencia por sección",
         dia,
         encabezados,
         filas,

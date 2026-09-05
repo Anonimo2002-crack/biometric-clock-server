@@ -136,6 +136,8 @@ def _alumno_asistencia(
     return {
         "id": str(persona.id),
         "nombre": persona.nombre,
+        "cui": persona.cui,
+        "employeeNo": persona.employeeNo,
         "gradoId": grado_id,
         "grado": grado_texto,
         "horaMarca": hora_marca,
@@ -241,6 +243,32 @@ async def armar_asistencia_grado(db: Prisma, fecha: str, grado_id: str) -> dict[
         "gradoId": grado["id"],
         "grado": grado["etiqueta"],
         "totales": totales_de(alumnos),
+        "alumnos": alumnos,
+    }
+
+
+async def armar_asistencia_secciones(db: Prisma, fecha: str) -> dict[str, Any]:
+    """Todas las secciones del día, para el reporte conjunto."""
+    inicio, fin = _rango_dia(fecha)
+    grados = await catalogo_grados(db)
+    alumnos = [
+        _alumno_asistencia(row, inicio, fin) for row in await _personas_del_dia(db, "ALUMNO", inicio, fin)
+    ]
+    secciones = []
+    for grado in grados:
+        del_grado = [item for item in alumnos if item["gradoId"] == grado["id"]]
+        secciones.append(
+            {
+                "gradoId": grado["id"],
+                "grado": grado["etiqueta"],
+                "totales": totales_de(del_grado),
+                "alumnos": del_grado,
+            }
+        )
+    return {
+        "fecha": fecha,
+        "totales": totales_de(alumnos),
+        "secciones": secciones,
         "alumnos": alumnos,
     }
 

@@ -20,6 +20,7 @@ MINOR_TODOS = 0
 MINOR_ROSTRO_OK = 75
 MINOR_HUELLA_OK = 113
 MINOR_TARJETA_OK = 38
+MINOR_CLAVE_OK = 21
 
 # Intentos rechazados: el aparato igual los guarda y no son asistencia.
 MINORES_FALLIDOS = {5, 6, 7, 8, 39, 74, 76, 114}
@@ -28,7 +29,7 @@ MINORES_FALLIDOS = {5, 6, 7, 8, 39, 74, 76, 114}
 # el reloj reporta muchos códigos (puerta abierta, revisión remota vencida, avisos
 # del sistema) y si se aceptara todo lo que no está en MINORES_FALLIDOS, cualquier
 # código nuevo entraría al tablero como si alguien hubiera llegado.
-MINORES_ASISTENCIA = {MINOR_ROSTRO_OK, MINOR_HUELLA_OK, MINOR_TARJETA_OK}
+MINORES_ASISTENCIA = {MINOR_ROSTRO_OK, MINOR_HUELLA_OK, MINOR_TARJETA_OK, MINOR_CLAVE_OK}
 
 
 class HikvisionError(RuntimeError):
@@ -108,12 +109,17 @@ class HikvisionClient:
         return response.json()
 
     def save_user(self, employee_no: str, nombre: str, editar: bool = False) -> None:
-        """Graba a la persona en el reloj. El employeeNo es la llave contra MySQL."""
+        """Graba a la persona en el reloj. El employeeNo es la llave contra MySQL.
+
+        El PIN del teclado es el mismo número de reloj: en el aparato se escribe
+        1000 y queda marcado, sin pasar por una pantalla web.
+        """
         cuerpo = {
             "UserInfo": {
                 "employeeNo": employee_no,
                 "name": nombre,
                 "userType": "normal",
+                "password": employee_no,
                 "Valid": {
                     "enable": True,
                     "beginTime": "2020-01-01T00:00:00",
@@ -134,6 +140,10 @@ class HikvisionClient:
                 "POST", "/ISAPI/AccessControl/UserInfo/Record?format=json", json=cuerpo
             )
             self._json_ok(respuesta, f"grabar a {nombre} en el reloj")
+
+    def asignar_pin(self, employee_no: str, nombre: str) -> None:
+        """Deja el número de reloj como clave del teclado, sin tocar huella ni cara."""
+        self.save_user(employee_no, nombre, editar=True)
 
     def delete_user(self, employee_no: str) -> None:
         cuerpo = {"UserInfoDelCond": {"EmployeeNoList": [{"employeeNo": employee_no}]}}

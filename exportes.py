@@ -204,11 +204,40 @@ def dashboard_filas(dto: dict[str, Any]) -> tuple[list[str], list[list[Any]]]:
 
 
 def asistencia_filas(dto: dict[str, Any]) -> tuple[list[str], list[list[Any]]]:
-    encabezados = ["Alumno", "Grado", "Hora de marca", "Estado"]
+    encabezados = ["Alumno", "CUI", "Código", "Sección", "Hora de marca", "Estado"]
     filas = [
-        [item["nombre"], item["grado"], item.get("horaMarca") or "Sin marca", _estado(item["estado"])]
+        [
+            item["nombre"],
+            item.get("cui") or "—",
+            item.get("employeeNo") or "—",
+            item["grado"],
+            item.get("horaMarca") or "Sin marca",
+            _estado(item["estado"]),
+        ]
         for item in dto.get("alumnos") or []
     ]
+    return encabezados, filas
+
+
+def asistencia_secciones_filas(dto: dict[str, Any]) -> tuple[list[str], list[list[Any]]]:
+    encabezados = ["Sección", "Alumno", "CUI", "Código", "Hora de marca", "Estado"]
+    filas: list[list[Any]] = []
+    for seccion in dto.get("secciones") or []:
+        alumnos = seccion.get("alumnos") or []
+        if not alumnos:
+            filas.append([seccion.get("grado") or "", "Sin alumnos", "—", "—", "—", "—"])
+            continue
+        for item in alumnos:
+            filas.append(
+                [
+                    seccion.get("grado") or item.get("grado") or "",
+                    item["nombre"],
+                    item.get("cui") or "—",
+                    item.get("employeeNo") or "—",
+                    item.get("horaMarca") or "Sin marca",
+                    _estado(item["estado"]),
+                ]
+            )
     return encabezados, filas
 
 
