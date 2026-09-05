@@ -638,6 +638,20 @@ async def _siguiente_employee_no(rol: str) -> str:
     return str(numero)
 
 
+NOMBRE_LETRA_RE = re.compile(r"[A-Za-zÁÉÍÓÚÜÑáéíóúüñ]")
+
+
+def _validar_nombre(valor: str | None) -> str:
+    texto = " ".join((valor or "").split())
+    partes = [p for p in texto.split(" ") if p and len(NOMBRE_LETRA_RE.findall(p)) >= 2]
+    if len(partes) < 4:
+        raise HTTPException(
+            status_code=400,
+            detail="El nombre va completo: 2 nombres y 2 apellidos.",
+        )
+    return texto
+
+
 def _validar_cui(valor: str | None, *, obligatorio: bool) -> str | None:
     texto = "".join(ch for ch in (valor or "") if ch.isdigit())
     if not texto:
@@ -762,7 +776,7 @@ async def _partes_persona(
     # reloj sigue con ADM-001 porque no tiene CUI.
     codigo = cui or (actual.codigo if actual else "ADM-001")
     base = {
-        "nombre": payload.nombre.strip(),
+        "nombre": _validar_nombre(payload.nombre),
         "cui": cui,
         "codigo": codigo,
         "employeeNo": employee_no,
