@@ -2,6 +2,9 @@ venv/
 asistencia.db
 asistencia.db-journal
 .env
+.correo-auto-ultimo
+.correo-ajustes.json
+.correo-avisos-enviados.json
 .mysql-data/
 .mysql-data-dev/
 .mysql-data-0/

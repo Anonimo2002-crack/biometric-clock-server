@@ -251,13 +251,12 @@ def ausencias_filas(dto: dict[str, Any]) -> tuple[list[str], list[list[Any]]]:
 
 
 def maestros_filas(dto: dict[str, Any]) -> tuple[list[str], list[list[Any]]]:
-    encabezados = ["Maestro", "Cargo", "Entrada", "Salida", "Estado"]
+    encabezados = ["Maestro", "Cargo", "Llegada", "Estado"]
     filas = [
         [
             item["nombre"],
             item.get("cargo") or "",
             item.get("horaEntrada") or "—",
-            item.get("horaSalida") or "—",
             _estado(item["estado"]),
         ]
         for item in dto.get("maestros") or []

@@ -7,6 +7,7 @@ import os
 import re
 from contextlib import asynccontextmanager, suppress
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Literal
 
 from dotenv import load_dotenv
@@ -38,7 +39,15 @@ from auth import (
     usuario_actual,
     verify_password,
 )
-from correo import CorreoError, enviar_ausencias, smtp_configurado
+from ajustes_correo import (
+    es_tarde,
+    guardar_ajustes,
+    leer_ajustes,
+    marcar_aviso_llegada,
+    minutos_de,
+    ya_aviso_llegada,
+)
+from correo import CorreoError, enviar_ausencias, enviar_llegadas, enviar_prueba, smtp_configurado
 from database import db
 from exportes import (
     armar_excel,
@@ -88,10 +97,11 @@ DEVICE_PASS_2 = os.getenv("DEVICE_PASS_2", "") or DEVICE_PASS
 DEVICE_TIMEOUT = int(os.getenv("DEVICE_TIMEOUT", "10"))
 # Cada cuántos minutos bajar los marcajes solo. En 0 queda apagado y hay que
 # darle al botón del tablero.
-SYNC_AUTO_MIN = int(os.getenv("SYNC_AUTO_MIN", "10"))
+SYNC_AUTO_MIN = int(os.getenv("SYNC_AUTO_MIN", "1"))
 # Días que revisa la primera corrida, para recoger lo que quedó en los relojes
 # mientras el servidor estuvo apagado.
 SYNC_AUTO_DIAS = int(os.getenv("SYNC_AUTO_DIAS", "3"))
+ARCHIVO_CORREO_AUTO = Path(__file__).resolve().parent / ".correo-auto-ultimo"
 # La captura de huella espera a que la persona ponga el dedo en el lector.
 CAPTURA_HUELLA_TIMEOUT = int(os.getenv("CAPTURA_HUELLA_TIMEOUT", "30"))
 CORS_ORIGINS = [item.strip() for item in os.getenv("CORS_ORIGINS", "*").split(",") if item.strip()]
@@ -193,6 +203,45 @@ async def _sync_automatico() -> None:
         await asyncio.sleep(SYNC_AUTO_MIN * 60)
 
 
+def _ultimo_correo_auto() -> str:
+    if not ARCHIVO_CORREO_AUTO.is_file():
+        return ""
+    return ARCHIVO_CORREO_AUTO.read_text(encoding="utf-8").strip()
+
+
+def _marcar_correo_auto(dia: str) -> None:
+    ARCHIVO_CORREO_AUTO.write_text(dia, encoding="utf-8")
+
+
+async def _correo_automatico() -> None:
+    """Si dirección lo deja prendido, avisa ausencias a la hora que ellos pongan."""
+    while True:
+        try:
+            ajustes = leer_ajustes()
+            ahora = datetime.now(TZ)
+            dia = ahora.date().isoformat()
+            hora_envio = ajustes["horaAusencia"]
+            if (
+                smtp_configurado()
+                and ajustes["avisoAusencia"]
+                and ahora.weekday() < 5
+                and (ahora.hour * 60 + ahora.minute) >= minutos_de(hora_envio)
+                and _ultimo_correo_auto() != dia
+            ):
+                inicio, fin, _ = _inicio_fin_dia(dia)
+                for ip in device_ips():
+                    await _sincronizar_ip(ip, inicio, fin, dia)
+                dto = await armar_ausencias(db, dia, hora_envio)
+                resultado = await asyncio.to_thread(enviar_ausencias, dto)
+                _marcar_correo_auto(dia)
+                print(f"Correo automático {dia} {hora_envio}: {resultado['destinatario']}")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - no debe tumbar el servidor
+            print(f"Correo automático falló: {exc}")
+        await asyncio.sleep(60)
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     if CORS_ORIGINS == ["*"]:
@@ -210,13 +259,24 @@ async def lifespan(_app: FastAPI):
     tarea = asyncio.create_task(_sync_automatico()) if SYNC_AUTO_MIN > 0 else None
     if tarea is None:
         print("AVISO: el sync automático está apagado (SYNC_AUTO_MIN=0).")
+    tarea_correo = asyncio.create_task(_correo_automatico())
+    ajustes = leer_ajustes()
+    print(
+        "Correo a padres: "
+        f"llegada={'sí' if ajustes['avisoLlegada'] else 'no'} · "
+        f"tarde={'sí' if ajustes['avisoTarde'] else 'no'} "
+        f"({ajustes['horaTarde']}) · "
+        f"ausencia={'sí' if ajustes['avisoAusencia'] else 'no'} "
+        f"({ajustes['horaAusencia']})."
+    )
     try:
         yield
     finally:
-        if tarea is not None:
-            tarea.cancel()
-            with suppress(asyncio.CancelledError):
-                await tarea
+        for pendiente in (tarea, tarea_correo):
+            if pendiente is not None:
+                pendiente.cancel()
+                with suppress(asyncio.CancelledError):
+                    await pendiente
         await db.disconnect()
 
 
@@ -281,6 +341,14 @@ class UsuarioOut(BaseModel):
 class ClaveIn(BaseModel):
     actual: str
     nueva: str
+
+
+class AjustesCorreoIn(BaseModel):
+    avisoLlegada: bool
+    avisoTarde: bool
+    avisoAusencia: bool
+    horaTarde: str
+    horaAusencia: str
 
 
 class AlumnoIn(BaseModel):
@@ -826,6 +894,47 @@ async def _serializar_asistencia(row: Any) -> AsistenciaOut:
     )
 
 
+async def _despachar_llegadas(pendientes: list[dict[str, Any]], dia: str) -> None:
+    """Un correo por la primera marca del día, si dirección lo dejó prendido."""
+    ajustes = leer_ajustes()
+    if not pendientes or not smtp_configurado():
+        return
+    if not ajustes["avisoLlegada"] and not ajustes["avisoTarde"]:
+        return
+    cola: list[dict[str, Any]] = []
+    for item in pendientes:
+        persona_id = int(item["personaId"])
+        if ya_aviso_llegada(dia, persona_id):
+            continue
+        destino = str(item.get("correoPadres") or "").strip()
+        if not destino or "@" not in destino:
+            continue
+        tarde = es_tarde(str(item["hora"]), ajustes["horaTarde"])
+        if tarde and not ajustes["avisoTarde"]:
+            if not ajustes["avisoLlegada"]:
+                continue
+            tarde = False
+        elif not tarde and not ajustes["avisoLlegada"]:
+            continue
+        cola.append(
+            {
+                **item,
+                "tarde": tarde,
+                "limite": ajustes["horaTarde"],
+                "fecha": dia,
+            }
+        )
+    if not cola:
+        return
+    resultado = await asyncio.to_thread(enviar_llegadas, cola)
+    for item in cola:
+        marcar_aviso_llegada(dia, int(item["personaId"]))
+    print(
+        f"Avisos de llegada {dia}: {resultado['enviados']} enviado(s), "
+        f"{resultado['sinCorreo']} sin correo."
+    )
+
+
 async def _sincronizar_ip(ip: str, inicio: datetime, fin: datetime, dia: str) -> SyncDispositivo:
     inicio_busqueda = (inicio - timedelta(days=1)).replace(tzinfo=None)
     fin_busqueda = (fin + timedelta(days=1)).replace(tzinfo=None)
@@ -845,6 +954,7 @@ async def _sincronizar_ip(ip: str, inicio: datetime, fin: datetime, dia: str) ->
     duplicados = 0
     creados_al_vuelo = 0
     ignorados = 0
+    pendientes_llegada: list[dict[str, Any]] = []
     ordenados = sorted(eventos, key=lambda item: str(item.get("time") or ""))
     for evento in ordenados:
         employee_no = str(evento.get("employeeNoString") or evento.get("employeeNo") or "").strip()
@@ -875,6 +985,36 @@ async def _sincronizar_ip(ip: str, inicio: datetime, fin: datetime, dia: str) ->
             )
             creados_al_vuelo += 1
         tipo = await _siguiente_tipo(persona.id, cuando)
+        hoy = datetime.now(TZ).date().isoformat()
+        if persona.rol == "ALUMNO" and tipo == "ENTRADA" and dia == hoy:
+            ya_entrada = await db.asistencia.find_first(
+                where={
+                    "personaId": persona.id,
+                    "tipo": "ENTRADA",
+                    "fechaHora": {"gte": inicio, "lt": fin},
+                }
+            )
+            if ya_entrada is None:
+                ficha = await db.persona.find_unique(
+                    where={"id": persona.id},
+                    include={"detalleAlumno": {"include": {"grado": True}}},
+                )
+                detalle = getattr(ficha, "detalleAlumno", None) if ficha else None
+                grado = getattr(detalle, "grado", None) if detalle else None
+                etiqueta = ""
+                if grado is not None:
+                    etiqueta = f"{grado.nombre.replace(' Primaria', '')} {grado.seccion}"
+                elif detalle is not None:
+                    etiqueta = detalle.gradoId
+                pendientes_llegada.append(
+                    {
+                        "personaId": persona.id,
+                        "nombre": persona.nombre,
+                        "grado": etiqueta,
+                        "correoPadres": getattr(detalle, "correoPadres", None) if detalle else None,
+                        "hora": cuando.astimezone(TZ).strftime("%H:%M"),
+                    }
+                )
         await db.asistencia.create(
             data={
                 "personaId": persona.id,
@@ -887,6 +1027,7 @@ async def _sincronizar_ip(ip: str, inicio: datetime, fin: datetime, dia: str) ->
         )
         nuevos += 1
 
+    await _despachar_llegadas(pendientes_llegada, dia)
     return SyncDispositivo(
         dispositivoIp=ip,
         consultados=len(eventos),
@@ -1751,11 +1892,48 @@ async def exportar_maestros(
 @app.get("/api/reportes/correo")
 async def estado_correo(_: Any = Depends(require_roles(*ROLES_CONSULTA))) -> dict[str, Any]:
     remitente = os.getenv("SMTP_FROM", "").strip() or os.getenv("SMTP_USER", "").strip()
+    ajustes = leer_ajustes()
     return {
         "configurado": smtp_configurado(),
         "destino": "el correo de los padres de cada alumno",
         "remitente": remitente or None,
+        "automatico": ajustes["avisoAusencia"],
+        "horaAuto": ajustes["horaAusencia"],
+        "horaCorte": ajustes["horaAusencia"],
+        **ajustes,
     }
+
+
+@app.get("/api/reportes/correo/ajustes")
+async def ver_ajustes_correo(_: Any = Depends(require_roles(*ROLES_SMTP))) -> dict[str, Any]:
+    remitente = os.getenv("SMTP_FROM", "").strip() or os.getenv("SMTP_USER", "").strip()
+    return {
+        "configurado": smtp_configurado(),
+        "remitente": remitente or None,
+        **leer_ajustes(),
+    }
+
+
+@app.put("/api/reportes/correo/ajustes")
+async def guardar_ajustes_correo(
+    body: AjustesCorreoIn,
+    _: Any = Depends(require_roles(*ROLES_SMTP)),
+) -> dict[str, Any]:
+    return guardar_ajustes(body.model_dump())
+
+
+@app.post("/api/reportes/correo/prueba")
+async def correo_prueba(_: Any = Depends(require_roles(*ROLES_SMTP))) -> dict[str, Any]:
+    if not smtp_configurado():
+        raise HTTPException(
+            status_code=503,
+            detail="SMTP no está configurado. Completa SMTP_HOST, SMTP_USER y SMTP_PASSWORD en el .env",
+        )
+    try:
+        destino = await asyncio.to_thread(enviar_prueba)
+    except CorreoError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return {"ok": True, "destinatario": destino}
 
 
 @app.post("/api/reportes/ausencias/enviar-correo")

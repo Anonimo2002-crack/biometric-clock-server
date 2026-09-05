@@ -150,7 +150,6 @@ def _alumno_asistencia(
 def _maestro_asistencia(persona: Any, inicio: datetime, fin: datetime) -> dict[str, Any]:
     marcajes = persona.marcajes or []
     entrada = _primera_entrada(marcajes, inicio, fin)
-    salida = _ultima_salida(marcajes, inicio, fin)
     hora_entrada = _hora_hhmm(entrada) if entrada else None
     detalle = getattr(persona, "detalleCatedratico", None)
     return {
@@ -158,7 +157,6 @@ def _maestro_asistencia(persona: Any, inicio: datetime, fin: datetime) -> dict[s
         "nombre": persona.nombre,
         "cargo": (detalle.cargo if detalle else None) or "Docente",
         "horaEntrada": hora_entrada,
-        "horaSalida": _hora_hhmm(salida) if salida else None,
         "estado": estado_por_hora(hora_entrada, HORA_LIMITE_TARDE_MAESTROS),
     }
 
