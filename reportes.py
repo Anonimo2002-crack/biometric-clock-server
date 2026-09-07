@@ -46,9 +46,8 @@ def estado_por_hora(
     limite_tarde: str,
     hora_corte: str | None = None,
 ) -> Estado:
+    """Si marcó, es presente o tarde. Ausente solo cuando no hay marca."""
     if not hora_marca:
-        return "ausente"
-    if hora_corte and _minutos(hora_marca) > _minutos(hora_corte):
         return "ausente"
     if _minutos(hora_marca) > _minutos(limite_tarde):
         return "tarde"
@@ -124,6 +123,23 @@ def _grado_de(persona: Any) -> tuple[str, str]:
     return grado.id, _etiqueta(grado.nombre, grado.seccion)
 
 
+def _telefono_util(valor: str | None) -> str:
+    digitos = "".join(ch for ch in (valor or "") if ch.isdigit())
+    if len(digitos) != 8 or set(digitos) == {"0"}:
+        return ""
+    return digitos
+
+
+def _encargado_de(detalle: Any) -> tuple[str | None, str | None]:
+    if detalle is None:
+        return None, None
+    nombre = (getattr(detalle, "contactoEmergenciaNombre", None) or "").strip() or None
+    telefono = _telefono_util(getattr(detalle, "telefonoPadres", None)) or _telefono_util(
+        getattr(detalle, "contactoEmergenciaTelefono", None)
+    )
+    return nombre, telefono or None
+
+
 def _alumno_asistencia(
     persona: Any,
     inicio: datetime,
@@ -134,6 +150,7 @@ def _alumno_asistencia(
     entrada = _primera_entrada(persona.marcajes or [], inicio, fin)
     hora_marca = _hora_hhmm(entrada) if entrada else None
     detalle = getattr(persona, "detalleAlumno", None)
+    encargado, telefono = _encargado_de(detalle)
     return {
         "id": str(persona.id),
         "nombre": persona.nombre,
@@ -142,6 +159,8 @@ def _alumno_asistencia(
         "gradoId": grado_id,
         "grado": grado_texto,
         "correoPadres": getattr(detalle, "correoPadres", None) if detalle else None,
+        "encargado": encargado,
+        "telefonoEncargado": telefono,
         "horaMarca": hora_marca,
         "estado": estado_por_hora(hora_marca, HORA_LIMITE_TARDE_ALUMNOS, hora_corte),
     }
@@ -288,6 +307,67 @@ async def armar_ausencias(db: Prisma, fecha: str, hora_corte: str) -> dict[str, 
         "porGrado": resumen_por_grado(del_dia, grados),
         "alumnos": ausentes,
     }
+
+
+async def armar_propia(db: Prisma, fecha: str, persona_id: int) -> dict[str, Any] | None:
+    """Un solo alumno o maestro: lo que puede ver el celular, nadie más."""
+    inicio, fin = _rango_dia(fecha)
+    persona = await db.persona.find_unique(
+        where={"id": persona_id},
+        include={
+            "marcajes": {"where": {"fechaHora": {"gte": inicio, "lt": fin}}},
+            "detalleAlumno": {"include": {"grado": True}},
+            "detalleCatedratico": True,
+        },
+    )
+    if persona is None:
+        return None
+
+    if persona.rol == "CATEDRATICO":
+        hoy = _maestro_asistencia(persona, inicio, fin)
+        detalle = hoy.get("cargo") or "Docente"
+        hora = hoy.get("horaEntrada")
+    else:
+        hoy = _alumno_asistencia(persona, inicio, fin)
+        detalle = hoy.get("grado") or ""
+        hora = hoy.get("horaMarca")
+
+    desde = inicio - timedelta(days=13)
+    recientes = await db.asistencia.find_many(
+        where={"personaId": persona_id, "fechaHora": {"gte": desde, "lt": fin}},
+        order={"fechaHora": "desc"},
+        take=40,
+    )
+    return {
+        "fecha": fecha,
+        "jornada": JORNADA,
+        "institucion": INSTITUCION,
+        "persona": {
+            "id": persona.id,
+            "nombre": persona.nombre,
+            "rol": persona.rol,
+            "detalle": detalle,
+        },
+        "hoy": {
+            "horaMarca": hora,
+            "estado": hoy["estado"],
+        },
+        "marcajes": [
+            {
+                "id": row.id,
+                "fechaHora": _iso_gt(row.fechaHora),
+                "tipo": row.tipo,
+                "metodo": row.metodo,
+            }
+            for row in recientes
+        ],
+    }
+
+
+def _iso_gt(valor: datetime) -> str:
+    if valor.tzinfo is None:
+        valor = valor.replace(tzinfo=timezone.utc)
+    return valor.astimezone(TZ).isoformat()
 
 
 async def armar_maestros(db: Prisma, fecha: str) -> dict[str, Any]:

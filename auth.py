@@ -17,8 +17,10 @@ load_dotenv()
 
 from database import db
 
-ROLES_SISTEMA = ("ADMIN", "DIRECCION", "SECRETARIA", "DOCENTE")
-ROLES_CONSULTA = ROLES_SISTEMA
+ROLES_SISTEMA = ("ADMIN", "DIRECCION", "SECRETARIA", "DOCENTE", "PROPIO")
+# El tablero de la escuela ve a todos. PROPIO solo entra a /api/mi-asistencia.
+ROLES_CONSULTA = ("ADMIN", "DIRECCION", "SECRETARIA", "DOCENTE")
+ROLES_PROPIO = ("PROPIO",)
 ROLES_EXPORTAR = ("ADMIN", "DIRECCION", "SECRETARIA")
 ROLES_MATRICULA_VER = ("ADMIN", "DIRECCION", "SECRETARIA")
 ROLES_MATRICULA_ESCRIBIR = ("ADMIN", "SECRETARIA")
@@ -102,6 +104,7 @@ def crear_token(usuario: Any) -> str:
         "usuario": usuario.usuario,
         "nombre": usuario.nombre,
         "rol": usuario.rol,
+        "personaId": getattr(usuario, "personaId", None),
         "iat": int(ahora.timestamp()),
         "exp": int((ahora + timedelta(hours=JWT_HOURS)).timestamp()),
     }

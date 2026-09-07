@@ -25,6 +25,13 @@ python -m uvicorn biometric-clock-server:app --host 0.0.0.0 --port 8000
 
 Swagger: http://127.0.0.1:8000/docs
 
+## Red de la escuela (QEMU + MySQL)
+
+En el Debian: `deploy/setup-red.sh`.
+
+- **SSH FreeBSD (QEMU):** el router manda **4010** al Debian **2224**, y QEMU lo entrega al **22** de FreeBSD. Docker no corre el kernel de FreeBSD; emula la imagen oficial.
+- **MySQL:** solo `127.0.0.1:3306`. El celular no abre el puerto 3306. Entra al tablero con el rol **Consulta propia** (`PROPIO`) y ve únicamente a la persona ligada a su cuenta.
+
 ## MySQL (PC de la escuela / Debian)
 
 La fuente de las tablas es `schema.prisma` (`Persona`, `DetalleAlumno`, `DetalleCatedratico`, `Grado`, `Dispositivo`, `Asistencia`, `Usuario`). No hay script SQL aparte: crea la base `asistencia_db` y corre `python -m prisma db push`.

@@ -1,0 +1,51 @@
+# Debian: MySQL para el tablero + FreeBSD por QEMU.
+#
+# Docker en Linux no corre un kernel FreeBSD. La "imagen" oficial se emula
+# con QEMU; el contenedor Debian solo la arranca.
+#
+# SSH:  celular/laptop → :4010 (router) → :2224 (Debian) → :22 (FreeBSD)
+# MySQL: solo 127.0.0.1:3306. El celular no entra a 3306; lee por el tablero.
+
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: asistencia-mysql
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      MYSQL_DATABASE: asistencia_db
+      MYSQL_USER: asistencia
+      MYSQL_PASSWORD: ${MYSQL_CLAVE:?pon MYSQL_CLAVE en deploy/.env}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT:?pon MYSQL_ROOT en deploy/.env}
+    ports:
+      - "127.0.0.1:3306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./mysql-init:/docker-entrypoint-initdb.d:ro
+    command:
+      - --bind-address=0.0.0.0
+      - --mysql-native-password=ON
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-p${MYSQL_ROOT}"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  freebsd-qemu:
+    image: debian:bookworm-slim
+    container_name: asistencia-freebsd-qemu
+    restart: unless-stopped
+    privileged: true
+    ports:
+      - "2224:2224"
+    volumes:
+      - freebsd_disk:/var/lib/freebsd
+      - ./freebsd-boot.sh:/usr/local/bin/boot-freebsd.sh:ro
+    environment:
+      FREEBSD_IMAGE_URL: https://download.freebsd.org/releases/VM-IMAGES/15.1-RELEASE/amd64/Latest/FreeBSD-15.1-RELEASE-amd64-ufs.qcow2.xz
+    entrypoint: ["/bin/bash", "/usr/local/bin/boot-freebsd.sh"]
+
+volumes:
+  mysql_data:
+  freebsd_disk:

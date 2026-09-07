@@ -10,7 +10,7 @@ from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 from reportlab.lib import colors
-from reportlab.lib.pagesizes import letter
+from reportlab.lib.pagesizes import landscape, letter
 from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import cm
 from reportlab.pdfbase import pdfmetrics
@@ -107,9 +107,10 @@ def _estilos_pdf() -> dict[str, ParagraphStyle]:
 
 def armar_pdf(titulo: str, subtitulo: str, encabezados: list[str], filas: list[list[Any]]) -> bytes:
     buffer = BytesIO()
+    pagina = landscape(letter) if len(encabezados) > 5 else letter
     doc = SimpleDocTemplate(
         buffer,
-        pagesize=letter,
+        pagesize=pagina,
         leftMargin=1.6 * cm,
         rightMargin=1.6 * cm,
         topMargin=1.4 * cm,
@@ -203,14 +204,24 @@ def dashboard_filas(dto: dict[str, Any]) -> tuple[list[str], list[list[Any]]]:
     return encabezados, filas
 
 
+def _encargado(item: dict[str, Any]) -> str:
+    return (item.get("encargado") or "").strip() or "—"
+
+
+def _telefono_encargado(item: dict[str, Any]) -> str:
+    return (item.get("telefonoEncargado") or "").strip() or "—"
+
+
 def asistencia_filas(dto: dict[str, Any]) -> tuple[list[str], list[list[Any]]]:
-    encabezados = ["Alumno", "CUI", "Código", "Sección", "Hora de marca", "Estado"]
+    encabezados = ["Alumno", "CUI", "Código", "Sección", "Encargado", "Teléfono", "Hora de marca", "Estado"]
     filas = [
         [
             item["nombre"],
             item.get("cui") or "—",
             item.get("employeeNo") or "—",
             item["grado"],
+            _encargado(item),
+            _telefono_encargado(item),
             item.get("horaMarca") or "Sin marca",
             _estado(item["estado"]),
         ]
@@ -220,12 +231,12 @@ def asistencia_filas(dto: dict[str, Any]) -> tuple[list[str], list[list[Any]]]:
 
 
 def asistencia_secciones_filas(dto: dict[str, Any]) -> tuple[list[str], list[list[Any]]]:
-    encabezados = ["Sección", "Alumno", "CUI", "Código", "Hora de marca", "Estado"]
+    encabezados = ["Sección", "Alumno", "CUI", "Código", "Encargado", "Teléfono", "Hora de marca", "Estado"]
     filas: list[list[Any]] = []
     for seccion in dto.get("secciones") or []:
         alumnos = seccion.get("alumnos") or []
         if not alumnos:
-            filas.append([seccion.get("grado") or "", "Sin alumnos", "—", "—", "—", "—"])
+            filas.append([seccion.get("grado") or "", "Sin alumnos", "—", "—", "—", "—", "—", "—"])
             continue
         for item in alumnos:
             filas.append(
@@ -234,6 +245,8 @@ def asistencia_secciones_filas(dto: dict[str, Any]) -> tuple[list[str], list[lis
                     item["nombre"],
                     item.get("cui") or "—",
                     item.get("employeeNo") or "—",
+                    _encargado(item),
+                    _telefono_encargado(item),
                     item.get("horaMarca") or "Sin marca",
                     _estado(item["estado"]),
                 ]
@@ -242,9 +255,16 @@ def asistencia_secciones_filas(dto: dict[str, Any]) -> tuple[list[str], list[lis
 
 
 def ausencias_filas(dto: dict[str, Any]) -> tuple[list[str], list[list[Any]]]:
-    encabezados = ["Alumno", "Grado", "Marca", "Estado"]
+    encabezados = ["Alumno", "Grado", "Encargado", "Teléfono", "Marca", "Estado"]
     filas = [
-        [item["nombre"], item["grado"], item.get("horaMarca") or "Sin marca", _estado(item["estado"])]
+        [
+            item["nombre"],
+            item["grado"],
+            _encargado(item),
+            _telefono_encargado(item),
+            item.get("horaMarca") or "Sin marca",
+            _estado(item["estado"]),
+        ]
         for item in dto.get("alumnos") or []
     ]
     return encabezados, filas

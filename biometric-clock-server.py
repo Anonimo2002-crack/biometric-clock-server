@@ -21,6 +21,7 @@ load_dotenv()
 
 from auth import (
     ROLES_CONSULTA,
+    ROLES_PROPIO,
     ROLES_DISPOSITIVO,
     ROLES_EXPORTAR,
     ROLES_MARCAR,
@@ -76,6 +77,7 @@ from reportes import (
     armar_ausencias,
     armar_dashboard,
     armar_maestros,
+    armar_propia,
     catalogo_grados,
     estado_por_hora,
 )
@@ -317,6 +319,7 @@ class LoginOut(BaseModel):
     nombre: str
     usuario: str
     rol: str
+    personaId: int | None = None
 
 
 class UsuarioIn(BaseModel):
@@ -325,6 +328,7 @@ class UsuarioIn(BaseModel):
     password: str | None = None
     rol: str
     activo: bool = True
+    personaId: int | None = None
 
 
 class UsuarioOut(BaseModel):
@@ -333,6 +337,8 @@ class UsuarioOut(BaseModel):
     usuario: str
     rol: str
     activo: bool
+    personaId: int | None = None
+    personaNombre: str | None = None
 
     class Config:
         from_attributes = True
@@ -752,14 +758,18 @@ async def _partes_persona(
         if await db.grado.find_unique(where={"id": grado}) is None:
             raise HTTPException(status_code=400, detail=f"El grado {grado} no está en el catálogo.")
         telefono = _validar_telefono(
-            payload.telefonoPadres, etiqueta="El teléfono de los padres", obligatorio=False
+            payload.telefonoPadres, etiqueta="El teléfono del encargado", obligatorio=False
         )
         correo = _validar_correo(payload.correoPadres)
+        encargado = (payload.contactoEmergenciaNombre or "").strip()
+        if len(encargado) > 80:
+            raise HTTPException(status_code=400, detail="El nombre del encargado es demasiado largo.")
         detalle_alumno = {
             "gradoId": grado,
             "fechaNacimiento": _parse_fecha_nacimiento(payload.fechaNacimiento),
             "telefonoPadres": telefono,
             "correoPadres": correo,
+            "contactoEmergenciaNombre": encargado or None,
         }
     elif rol == "CATEDRATICO":
         cargo = (payload.cargo or "").strip() or None
@@ -1139,12 +1149,14 @@ async def login(payload: LoginIn, request: Request) -> LoginOut:
         nombre=fila.nombre,
         usuario=fila.usuario,
         rol=fila.rol,
+        personaId=fila.personaId,
     )
 
 
 @app.get("/api/auth/me", response_model=UsuarioOut)
 async def me(usuario: Any = Depends(usuario_actual)) -> UsuarioOut:
-    return UsuarioOut.model_validate(usuario)
+    fila = await db.usuario.find_unique(where={"id": usuario.id}, include={"persona": True})
+    return _usuario_out(fila or usuario)
 
 
 @app.post("/api/auth/cambiar-clave")
@@ -1163,29 +1175,63 @@ async def cambiar_clave(payload: ClaveIn, usuario: Any = Depends(usuario_actual)
 # --- usuarios del sistema ---
 
 
+def _usuario_out(fila: Any) -> UsuarioOut:
+    persona = getattr(fila, "persona", None)
+    return UsuarioOut(
+        id=fila.id,
+        nombre=fila.nombre,
+        usuario=fila.usuario,
+        rol=fila.rol,
+        activo=fila.activo,
+        personaId=fila.personaId,
+        personaNombre=persona.nombre if persona else None,
+    )
+
+
+async def _persona_de_consulta(rol: str, persona_id: int | None) -> int | None:
+    """PROPIO tiene que apuntar a un alumno o maestro. Los demás no ligan a nadie."""
+    if rol != "PROPIO":
+        return None
+    if not persona_id:
+        raise HTTPException(
+            status_code=400,
+            detail="La consulta propia tiene que ir ligada a un alumno o a un maestro.",
+        )
+    persona = await db.persona.find_unique(where={"id": persona_id})
+    if persona is None or not persona.activo:
+        raise HTTPException(status_code=400, detail="No existe esa persona en la matrícula.")
+    if persona.rol not in {"ALUMNO", "CATEDRATICO"}:
+        raise HTTPException(status_code=400, detail="Solo se puede ligar a un alumno o a un catedrático.")
+    return persona.id
+
+
 @app.get("/api/usuarios", response_model=list[UsuarioOut])
 async def listar_usuarios(_: Any = Depends(require_roles(*ROLES_USUARIOS))) -> list[UsuarioOut]:
-    filas = await db.usuario.find_many(order={"nombre": "asc"})
-    return [UsuarioOut.model_validate(fila) for fila in filas]
+    filas = await db.usuario.find_many(include={"persona": True}, order={"nombre": "asc"})
+    return [_usuario_out(fila) for fila in filas]
 
 
 @app.post("/api/usuarios", response_model=UsuarioOut)
 async def crear_usuario(payload: UsuarioIn, _: Any = Depends(require_roles(*ROLES_USUARIOS))) -> UsuarioOut:
     if not payload.password or len(payload.password.strip()) < 6:
         raise HTTPException(status_code=400, detail="La contraseña debe tener al menos 6 caracteres.")
+    rol = _validar_rol_sistema(payload.rol)
+    persona_id = await _persona_de_consulta(rol, payload.personaId)
     try:
         fila = await db.usuario.create(
             data={
                 "nombre": payload.nombre.strip(),
                 "usuario": payload.usuario.strip(),
                 "passwordHash": hash_password(payload.password.strip()),
-                "rol": _validar_rol_sistema(payload.rol),
+                "rol": rol,
                 "activo": payload.activo,
-            }
+                "personaId": persona_id,
+            },
+            include={"persona": True},
         )
     except UniqueViolationError as exc:
         raise HTTPException(status_code=409, detail="Ese usuario ya existe.") from exc
-    return UsuarioOut.model_validate(fila)
+    return _usuario_out(fila)
 
 
 @app.put("/api/usuarios/{usuario_id}", response_model=UsuarioOut)
@@ -1197,21 +1243,23 @@ async def editar_usuario(
     actual = await db.usuario.find_unique(where={"id": usuario_id})
     if actual is None:
         raise HTTPException(status_code=404, detail="Usuario no encontrado.")
+    rol = _validar_rol_sistema(payload.rol)
     data: dict[str, Any] = {
         "nombre": payload.nombre.strip(),
         "usuario": payload.usuario.strip(),
-        "rol": _validar_rol_sistema(payload.rol),
+        "rol": rol,
         "activo": payload.activo,
+        "personaId": await _persona_de_consulta(rol, payload.personaId),
     }
     if payload.password and payload.password.strip():
         if len(payload.password.strip()) < 6:
             raise HTTPException(status_code=400, detail="La contraseña debe tener al menos 6 caracteres.")
         data["passwordHash"] = hash_password(payload.password.strip())
     try:
-        fila = await db.usuario.update(where={"id": usuario_id}, data=data)
+        fila = await db.usuario.update(where={"id": usuario_id}, data=data, include={"persona": True})
     except UniqueViolationError as exc:
         raise HTTPException(status_code=409, detail="Ese usuario ya existe.") from exc
-    return UsuarioOut.model_validate(fila)
+    return _usuario_out(fila)
 
 
 @app.delete("/api/usuarios/{usuario_id}", response_model=UsuarioOut)
@@ -1863,6 +1911,25 @@ async def get_maestros(
 ) -> dict[str, Any]:
     _inicio_fin_dia(fecha)
     return await armar_maestros(db, _fecha_query(fecha))
+
+
+@app.get("/api/mi-asistencia")
+async def get_mi_asistencia(
+    fecha: str | None = Query(default=None, description="YYYY-MM-DD"),
+    sesion: Any = Depends(require_roles(*ROLES_PROPIO)),
+) -> dict[str, Any]:
+    """Celular/tablet: solo la persona ligada a la cuenta. Nunca el listado de todos."""
+    _inicio_fin_dia(fecha)
+    persona_id = sesion.personaId
+    if not persona_id:
+        raise HTTPException(
+            status_code=400,
+            detail="Esta cuenta no está ligada a un alumno o maestro.",
+        )
+    dto = await armar_propia(db, _fecha_query(fecha), int(persona_id))
+    if dto is None:
+        raise HTTPException(status_code=404, detail="No se encontró a la persona de esta cuenta.")
+    return dto
 
 
 # --- PDF / Excel / SMTP ---

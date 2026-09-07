@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 import uuid
 from datetime import datetime
 from email.parser import BytesParser
@@ -184,9 +185,7 @@ class HikvisionClient:
 
     def _parse_captura(self, respuesta: requests.Response, finger_no: int) -> dict[str, Any]:
         if respuesta.status_code != 200:
-            raise HikvisionError(
-                f"capturar la huella: HTTP {respuesta.status_code} {respuesta.text[:200]}"
-            )
+            raise HikvisionError(self._mensaje_error_reloj("capturar la huella", respuesta))
         texto = respuesta.text or ""
         tipo = (respuesta.headers.get("Content-Type") or "").lower()
         if "json" in tipo or texto.lstrip().startswith("{"):
@@ -305,6 +304,28 @@ class HikvisionClient:
 
     def capture_face(self, timeout: int = 30) -> bytes:
         """Prende la cámara y espera a que la persona mire al reloj."""
+        self._cancelar_captura_cara()
+        self._despertar_camara()
+        try:
+            return self._pedir_cara(timeout)
+        except HikvisionError as exc:
+            texto = str(exc)
+            if "no respondió a tiempo" in texto:
+                raise HikvisionError(
+                    "La cámara se encendió, pero no alcanzó a tomar la cara. "
+                    "Quedate frente al reloj, dale otra vez a Capturar rostro y mirá la pantalla."
+                ) from exc
+            if _camara_ocupada(texto):
+                self._cancelar_captura_cara()
+                time.sleep(1.5)
+                self._despertar_camara()
+                try:
+                    return self._pedir_cara(timeout)
+                except HikvisionError as segundo:
+                    raise HikvisionError(_mensaje_cara(str(segundo))) from segundo
+            raise HikvisionError(_mensaje_cara(texto)) from exc
+
+    def _pedir_cara(self, timeout: int) -> bytes:
         xml = (
             '<?xml version="1.0" encoding="UTF-8"?>'
             '<CaptureFaceDataCond version="2.0" '
@@ -313,22 +334,56 @@ class HikvisionClient:
             "<dataType>binary</dataType>"
             "</CaptureFaceDataCond>"
         )
+        respuesta = self._request(
+            "POST",
+            "/ISAPI/AccessControl/CaptureFaceData",
+            data=xml.encode("utf-8"),
+            headers={"Content-Type": "application/xml"},
+            timeout=timeout,
+        )
+        return self._parse_cara(respuesta)
+
+    def _cancelar_captura_cara(self) -> None:
+        xml = (
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            '<CaptureFaceDataCond version="2.0" '
+            'xmlns="http://www.isapi.org/ver20/XMLSchema">'
+            "<captureInfrared>false</captureInfrared>"
+            "<dataType>binary</dataType>"
+            "<cancelFlag>true</cancelFlag>"
+            "</CaptureFaceDataCond>"
+        )
         try:
-            respuesta = self._request(
+            self._request(
                 "POST",
                 "/ISAPI/AccessControl/CaptureFaceData",
                 data=xml.encode("utf-8"),
                 headers={"Content-Type": "application/xml"},
-                timeout=timeout,
+                timeout=5,
             )
-        except HikvisionError as exc:
-            if "no respondió a tiempo" in str(exc):
-                raise HikvisionError(
-                    "La cámara se encendió, pero no alcanzó a tomar la cara. "
-                    "Quedate frente al reloj, dale otra vez a Capturar rostro y mirá la pantalla."
-                ) from exc
-            raise
-        return self._parse_cara(respuesta)
+        except HikvisionError:
+            return
+
+    def _despertar_camara(self) -> None:
+        """El C270 se duerme con la pantalla. Un snapshot lo despierta."""
+        try:
+            self._request("GET", "/ISAPI/Streaming/channels/101/picture", timeout=5)
+        except HikvisionError:
+            return
+
+    def _mensaje_error_reloj(self, accion: str, respuesta: requests.Response) -> str:
+        detalle = _detalle_respuesta(respuesta)
+        if "rostro" in accion:
+            amable = _mensaje_cara(detalle)
+            if amable and amable != detalle:
+                return amable
+        else:
+            amable = _mensaje_huella(detalle)
+            if amable and amable != detalle:
+                return amable
+        if detalle:
+            return f"{accion}: {detalle}"
+        return f"{accion}: el reloj respondió HTTP {respuesta.status_code}."
 
     def save_face(self, employee_no: str, jpeg: bytes) -> None:
         if not jpeg:
@@ -387,9 +442,7 @@ class HikvisionClient:
 
     def _parse_cara(self, respuesta: requests.Response) -> bytes:
         if respuesta.status_code != 200:
-            raise HikvisionError(
-                f"capturar el rostro: HTTP {respuesta.status_code} {respuesta.text[:200]}"
-            )
+            raise HikvisionError(self._mensaje_error_reloj("capturar el rostro", respuesta))
         tipo = (respuesta.headers.get("Content-Type") or "").lower()
         crudo = respuesta.content or b""
         if "image/jpeg" in tipo or crudo[:2] == b"\xff\xd8":
@@ -487,6 +540,63 @@ class HikvisionClient:
             if status != "MORE" and position >= total:
                 break
         return events
+
+
+def _detalle_respuesta(respuesta: requests.Response) -> str:
+    texto = respuesta.text or ""
+    if "<" in texto:
+        try:
+            root = ET.fromstring(texto[texto.find("<") :])
+            return (
+                _xml_texto(root, "errorMsg")
+                or _xml_texto(root, "subStatusCode")
+                or _xml_texto(root, "statusString")
+            )
+        except ET.ParseError:
+            pass
+    if texto.lstrip().startswith("{"):
+        try:
+            cuerpo = respuesta.json()
+            return str(
+                cuerpo.get("errorMsg")
+                or cuerpo.get("subStatusCode")
+                or cuerpo.get("statusString")
+                or ""
+            )
+        except ValueError:
+            pass
+    return ""
+
+
+def _camara_ocupada(texto: str) -> bool:
+    t = (texto or "").lower()
+    return any(
+        clave in t
+        for clave in ("devicenotconnect", "devicebusy", "no se pudo conectar", "ocupad")
+    )
+
+
+def _mensaje_cara(texto: str) -> str:
+    t = (texto or "").lower()
+    if "devicenotconnect" in t or "no se pudo conectar" in t:
+        return (
+            "La cámara del reloj no arrancó. Tocá la pantalla para despertarlo, "
+            "quedate frente al que elegiste (A o B) y dale una sola vez a Capturar rostro."
+        )
+    if "devicebusy" in t or "busy" in t:
+        return "El reloj sigue ocupado con la captura anterior. Esperá 10 segundos y volvé a intentar."
+    return texto or ""
+
+
+def _mensaje_huella(texto: str) -> str:
+    t = (texto or "").lower()
+    if "devicenotconnect" in t or "no se pudo conectar" in t:
+        return (
+            "El lector de huella no arrancó. Tocá la pantalla del reloj y dale otra vez a Capturar huella."
+        )
+    if "devicebusy" in t or "busy" in t:
+        return "El reloj sigue ocupado. Esperá 10 segundos y volvé a intentar."
+    return texto or ""
 
 
 def _local_name(tag: str) -> str:

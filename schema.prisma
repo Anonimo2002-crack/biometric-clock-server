@@ -33,6 +33,7 @@ model Persona {
   detalleAlumno      DetalleAlumno?
   detalleCatedratico DetalleCatedratico?
   marcajes           Asistencia[]
+  cuentas            Usuario[]
 
   @@index([rol, activo])
   @@map("personas")
@@ -127,8 +128,13 @@ model Usuario {
   passwordHash  String
   rol           String
   activo        Boolean  @default(true)
+  // Solo el rol PROPIO: la cuenta del celular ve a esta persona y a nadie más.
+  personaId     Int?
   creadoEn      DateTime @default(now())
   actualizadoEn DateTime @default(now()) @updatedAt
 
+  persona Persona? @relation(fields: [personaId], references: [id])
+
+  @@index([personaId])
   @@map("usuarios")
 }
