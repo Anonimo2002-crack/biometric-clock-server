@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from io import BytesIO
 from pathlib import Path
 from typing import Any
@@ -105,9 +106,21 @@ def _estilos_pdf() -> dict[str, ParagraphStyle]:
     }
 
 
+def _texto_pdf(valor: Any, estilo: ParagraphStyle) -> Paragraph:
+    texto = "" if valor is None else str(valor)
+    texto = (
+        texto.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace("\n", "<br/>")
+    )
+    return Paragraph(texto or "—", estilo)
+
+
 def armar_pdf(titulo: str, subtitulo: str, encabezados: list[str], filas: list[list[Any]]) -> bytes:
     buffer = BytesIO()
     pagina = landscape(letter) if len(encabezados) > 5 else letter
+    ancho_util = pagina[0] - 3.2 * cm
     doc = SimpleDocTemplate(
         buffer,
         pagesize=pagina,
@@ -119,29 +132,53 @@ def armar_pdf(titulo: str, subtitulo: str, encabezados: list[str], filas: list[l
         author=INSTITUCION,
     )
     estilos = _estilos_pdf()
+    tam = 7 if len(encabezados) > 8 else 8
+    estilo_celda = ParagraphStyle(
+        "celda",
+        fontName=_FONT_NAME,
+        fontSize=tam,
+        leading=tam + 2.2,
+        textColor=_PINO,
+    )
+    estilo_cabeza = ParagraphStyle(
+        "cabeza",
+        parent=estilo_celda,
+        fontName=_FONT_BOLD,
+        textColor=colors.white,
+    )
     story: list[Any] = [
         Paragraph(INSTITUCION, estilos["kicker"]),
         Paragraph(titulo, estilos["titulo"]),
         Paragraph(f"{JORNADA} · {_fecha_gt(subtitulo) if len(subtitulo) == 10 else subtitulo}", estilos["meta"]),
         Spacer(1, 6),
     ]
-    datos = [encabezados, *[[("" if cell is None else str(cell)) for cell in fila] for fila in filas]]
-    tabla = Table(datos, repeatRows=1)
+    n = max(len(encabezados), 1)
+    if n == 1:
+        anchos = [ancho_util]
+    else:
+        nombre = min(ancho_util * 0.30, 5.8 * cm)
+        resto = (ancho_util - nombre) / (n - 1)
+        anchos = [nombre] + [resto] * (n - 1)
+    datos = [
+        [_texto_pdf(celda, estilo_cabeza) for celda in encabezados],
+        *[[_texto_pdf(celda, estilo_celda) for celda in fila] for fila in filas],
+    ]
+    tabla = Table(datos, colWidths=anchos, repeatRows=1)
     tabla.setStyle(
         TableStyle(
             [
                 ("FONTNAME", (0, 0), (-1, 0), _FONT_BOLD),
                 ("FONTNAME", (0, 1), (-1, -1), _FONT_NAME),
-                ("FONTSIZE", (0, 0), (-1, -1), 8),
+                ("FONTSIZE", (0, 0), (-1, -1), tam),
                 ("BACKGROUND", (0, 0), (-1, 0), _PINO),
                 ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
                 ("BACKGROUND", (0, 1), (-1, -1), _PAPEL),
                 ("GRID", (0, 0), (-1, -1), 0.3, _LINEA),
                 ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-                ("LEFTPADDING", (0, 0), (-1, -1), 6),
-                ("RIGHTPADDING", (0, 0), (-1, -1), 6),
-                ("TOPPADDING", (0, 0), (-1, -1), 5),
-                ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+                ("LEFTPADDING", (0, 0), (-1, -1), 4),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+                ("TOPPADDING", (0, 0), (-1, -1), 4),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
             ]
         )
     )
@@ -271,14 +308,164 @@ def ausencias_filas(dto: dict[str, Any]) -> tuple[list[str], list[list[Any]]]:
 
 
 def maestros_filas(dto: dict[str, Any]) -> tuple[list[str], list[list[Any]]]:
-    encabezados = ["Maestro", "Cargo", "Llegada", "Estado"]
+    encabezados = ["Maestro", "Cargo", "Entrada", "Salida", "Estado"]
     filas = [
         [
             item["nombre"],
             item.get("cargo") or "",
             item.get("horaEntrada") or "—",
+            item.get("horaSalida") or "—",
             _estado(item["estado"]),
         ]
         for item in dto.get("maestros") or []
     ]
+    return encabezados, filas
+
+
+def subtitulo_periodo(desde: str, hasta: str) -> str:
+    return _fecha_gt(desde) if desde == hasta else f"{_fecha_gt(desde)} — {_fecha_gt(hasta)}"
+
+
+def _col_dia(fecha: str) -> str:
+    dia = datetime.strptime(fecha, "%Y-%m-%d")
+    nombres = ("lun", "mar", "mié", "jue", "vie", "sáb", "dom")
+    return f"{nombres[dia.weekday()]} {dia.strftime('%d/%m')}"
+
+
+def _lista_ausentes(item: dict[str, Any]) -> str:
+    fechas = item.get("fechasAusente") or []
+    if not fechas:
+        return "—"
+    return ", ".join(_fecha_gt(fecha)[:5] for fecha in fechas)
+
+
+def _celda_alumno(item: dict[str, Any]) -> str:
+    if item.get("estado") == "ausente":
+        return "A"
+    hora = item.get("horaMarca") or "—"
+    return f"T {hora}" if item.get("estado") == "tarde" else hora
+
+
+def _celda_maestro(item: dict[str, Any]) -> str:
+    if item.get("estado") == "ausente":
+        return "A"
+    entrada = item.get("horaEntrada") or "—"
+    salida = item.get("horaSalida")
+    marca = f"{entrada}–{salida}" if salida else entrada
+    return f"T {marca}" if item.get("estado") == "tarde" else marca
+
+
+def dashboard_periodo_filas(dto: dict[str, Any]) -> tuple[list[str], list[list[Any]]]:
+    encabezados = [
+        "Fecha",
+        "Alumnos presentes",
+        "Tarde",
+        "Ausentes",
+        "%",
+        "Maestros presentes",
+        "Tarde",
+        "Ausentes",
+    ]
+    filas = []
+    for item in dto.get("filas") or []:
+        alumnos = item.get("alumnos") or {}
+        maestros = item.get("maestros") or {}
+        filas.append(
+            [
+                _fecha_gt(item.get("fecha") or ""),
+                alumnos.get("presentes", 0),
+                alumnos.get("tardes", 0),
+                alumnos.get("ausentes", 0),
+                alumnos.get("porcentaje", 0),
+                maestros.get("presentes", 0),
+                maestros.get("tardes", 0),
+                maestros.get("ausentes", 0),
+            ]
+        )
+    return encabezados, filas
+
+
+def asistencia_periodo_filas(dto: dict[str, Any], formato: str) -> tuple[list[str], list[list[Any]]]:
+    dias = dto.get("dias") or []
+    alumnos = dto.get("alumnos") or []
+    con_seccion = not dto.get("gradoId")
+    if formato == "pdf" and len(dias) > 7:
+        encabezados = (["Alumno", "Sección"] if con_seccion else ["Alumno"]) + [
+            "Presente",
+            "Tarde",
+            "Ausente",
+            "Días ausente",
+        ]
+        filas = []
+        for item in alumnos:
+            fila: list[Any] = [item["nombre"]]
+            if con_seccion:
+                fila.append(item.get("grado") or "")
+            fila.extend(
+                [item.get("presentes", 0), item.get("tardes", 0), item.get("ausentes", 0), _lista_ausentes(item)]
+            )
+            filas.append(fila)
+        return encabezados, filas
+    encabezados = (["Alumno", "Sección"] if con_seccion else ["Alumno"]) + [_col_dia(dia) for dia in dias] + [
+        "P",
+        "T",
+        "A",
+    ]
+    filas = []
+    for item in alumnos:
+        por = item.get("porDia") or {}
+        fila = [item["nombre"]]
+        if con_seccion:
+            fila.append(item.get("grado") or "")
+        for dia in dias:
+            fila.append(_celda_alumno(por.get(dia) or {"estado": "ausente"}))
+        fila.extend([item.get("presentes", 0), item.get("tardes", 0), item.get("ausentes", 0)])
+        filas.append(fila)
+    return encabezados, filas
+
+
+def ausencias_periodo_filas(dto: dict[str, Any]) -> tuple[list[str], list[list[Any]]]:
+    encabezados = ["Fecha", "Alumno", "Grado", "Encargado", "Teléfono", "Marca", "Estado"]
+    filas = [
+        [
+            _fecha_gt(item.get("fecha") or ""),
+            item["nombre"],
+            item["grado"],
+            _encargado(item),
+            _telefono_encargado(item),
+            item.get("horaMarca") or "Sin marca",
+            _estado(item["estado"]),
+        ]
+        for item in dto.get("alumnos") or []
+    ]
+    return encabezados, filas
+
+
+def maestros_periodo_filas(dto: dict[str, Any], formato: str) -> tuple[list[str], list[list[Any]]]:
+    dias = dto.get("dias") or []
+    maestros = dto.get("maestros") or []
+    if formato == "pdf" and len(dias) > 7:
+        encabezados = ["Maestro", "Cargo", "Presente", "Tarde", "Ausente", "Sin salida", "Días ausente"]
+        filas = [
+            [
+                item["nombre"],
+                item.get("cargo") or "",
+                item.get("presentes", 0),
+                item.get("tardes", 0),
+                item.get("ausentes", 0),
+                item.get("sinSalida") or 0,
+                _lista_ausentes(item),
+            ]
+            for item in maestros
+        ]
+        return encabezados, filas
+    encabezados = ["Maestro", "Cargo"] + [_col_dia(dia) for dia in dias] + ["P", "T", "A"]
+    filas = []
+    for item in maestros:
+        por = item.get("porDia") or {}
+        fila: list[Any] = [item["nombre"], item.get("cargo") or ""]
+        for dia in dias:
+            fila.append(_celda_maestro(por.get(dia) or {"estado": "ausente"}))
+        fila.extend([item.get("presentes", 0), item.get("tardes", 0), item.get("ausentes", 0)])
+        filas.append(fila)
     return encabezados, filas

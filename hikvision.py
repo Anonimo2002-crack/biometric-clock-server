@@ -241,6 +241,51 @@ class HikvisionClient:
             bloque.get("numberOfFP") or bloque.get("fingerPrintNum") or bloque.get("num") or 0
         )
 
+    def count_faces(self, employee_no: str) -> int:
+        """Cuántas caras hay en la librería para este número de reloj."""
+        cuerpos = [
+            {
+                "searchResultPosition": 0,
+                "maxResults": 10,
+                "faceLibType": "blackFD",
+                "FDID": "1",
+                "FPID": employee_no,
+            },
+            {
+                "searchID": str(uuid.uuid4()),
+                "searchResultPosition": 0,
+                "maxResults": 10,
+                "faceLibType": "blackFD",
+                "FDID": "1",
+                "FPID": employee_no,
+            },
+        ]
+        ultimo: HikvisionError | None = None
+        for cuerpo in cuerpos:
+            respuesta = self._request(
+                "POST",
+                "/ISAPI/Intelligent/FDLib/FDSearch?format=json",
+                json=cuerpo,
+            )
+            try:
+                datos = self._json_ok(respuesta, f"buscar el rostro del {employee_no}")
+            except HikvisionError as exc:
+                ultimo = exc
+                continue
+            total = datos.get("totalMatches")
+            if total is not None:
+                return int(total)
+            coincidencias = datos.get("numOfMatches")
+            if coincidencias is not None:
+                return int(coincidencias)
+            lista = datos.get("MatchList") or datos.get("FaceSearchResult") or []
+            if isinstance(lista, dict):
+                lista = [lista]
+            return len(lista)
+        if ultimo:
+            raise ultimo
+        return 0
+
     def delete_fingerprints(self, employee_no: str) -> None:
         intentos = [
             {"FingerPrintDelete": {"EmployeeNoDetail": {"employeeNo": employee_no}}},
@@ -257,6 +302,7 @@ class HikvisionClient:
                 }
             },
         ]
+        acepto = False
         ultimo: HikvisionError | None = None
         for cuerpo in intentos:
             respuesta = self._request(
@@ -264,11 +310,46 @@ class HikvisionClient:
             )
             try:
                 self._json_ok(respuesta, f"borrar huellas del {employee_no}")
-                return
+                acepto = True
+                if self._huellas_restantes(employee_no) == 0:
+                    return
             except HikvisionError as exc:
                 ultimo = exc
+        self._borrar_huellas_por_dedo(employee_no)
+        if self._huellas_restantes(employee_no) == 0:
+            return
+        if acepto:
+            raise HikvisionError(
+                f"El reloj {self.ip} dijo que borró, pero sigue con huella del {employee_no}."
+            )
         if ultimo:
             raise ultimo
+        raise HikvisionError(f"No se pudieron borrar las huellas del {employee_no} en {self.ip}.")
+
+    def _borrar_huellas_por_dedo(self, employee_no: str) -> None:
+        for dedo in range(1, 11):
+            cuerpo = {
+                "FingerPrintDelete": {
+                    "mode": "byFingerPrintID",
+                    "fingerPrintID": dedo,
+                    "EmployeeNoDetail": {"employeeNo": employee_no},
+                }
+            }
+            try:
+                respuesta = self._request(
+                    "PUT", "/ISAPI/AccessControl/FingerPrint/Delete?format=json", json=cuerpo
+                )
+                self._json_ok(respuesta, f"borrar el dedo {dedo} del {employee_no}")
+            except HikvisionError:
+                continue
+
+    def _huellas_restantes(self, employee_no: str) -> int:
+        time.sleep(0.35)
+        try:
+            return self.count_fingerprints(employee_no)
+        except HikvisionError:
+            fila = self.buscar_usuario(employee_no) or {}
+            return int(fila.get("numOfFP") or fila.get("fingerPrintNum") or 0)
 
     def buscar_usuario(self, employee_no: str) -> dict[str, Any] | None:
         cuerpo = {
@@ -297,10 +378,15 @@ class HikvisionClient:
         fila = self.buscar_usuario(employee_no)
         if fila is None:
             raise HikvisionError(f"El {employee_no} no está grabado en {self.ip}.")
-        return {
-            "huellas": int(fila.get("numOfFP") or 0),
-            "caras": int(fila.get("numOfFace") or 0),
-        }
+        try:
+            huellas = self.count_fingerprints(employee_no)
+        except HikvisionError:
+            huellas = int(fila.get("numOfFP") or fila.get("fingerPrintNum") or 0)
+        try:
+            caras = self.count_faces(employee_no)
+        except HikvisionError:
+            caras = int(fila.get("numOfFace") or fila.get("numOfFaceData") or 0)
+        return {"huellas": huellas, "caras": caras}
 
     def capture_face(self, timeout: int = 30) -> bytes:
         """Prende la cámara y espera a que la persona mire al reloj."""
@@ -424,7 +510,9 @@ class HikvisionClient:
         intentos = [
             {"FPID": [{"value": employee_no}]},
             {"FPID": [employee_no]},
+            {"faceLibType": "blackFD", "FDID": "1", "FPID": employee_no},
         ]
+        acepto = False
         ultimo: HikvisionError | None = None
         for cuerpo in intentos:
             respuesta = self._request(
@@ -434,11 +522,28 @@ class HikvisionClient:
             )
             try:
                 self._json_ok(respuesta, f"borrar el rostro del {employee_no}")
-                return
+                acepto = True
+                if self._caras_restantes(employee_no) == 0:
+                    return
             except HikvisionError as exc:
                 ultimo = exc
+        if self._caras_restantes(employee_no) == 0:
+            return
+        if acepto:
+            raise HikvisionError(
+                f"El reloj {self.ip} dijo que borró, pero sigue con el rostro del {employee_no}."
+            )
         if ultimo:
             raise ultimo
+        raise HikvisionError(f"No se pudo borrar el rostro del {employee_no} en {self.ip}.")
+
+    def _caras_restantes(self, employee_no: str) -> int:
+        time.sleep(0.35)
+        try:
+            return self.count_faces(employee_no)
+        except HikvisionError:
+            fila = self.buscar_usuario(employee_no) or {}
+            return int(fila.get("numOfFace") or fila.get("numOfFaceData") or 0)
 
     def _parse_cara(self, respuesta: requests.Response) -> bytes:
         if respuesta.status_code != 200:

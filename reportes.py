@@ -99,6 +99,117 @@ def _rango_dia(fecha: str) -> tuple[datetime, datetime]:
     return inicio, inicio + timedelta(days=1)
 
 
+class FechaInvalida(ValueError):
+    pass
+
+
+MAX_DIAS_RANGO = 62
+
+
+def _fecha_iso(valor: str) -> str:
+    try:
+        return datetime.strptime(valor, "%Y-%m-%d").date().isoformat()
+    except ValueError as exc:
+        raise FechaInvalida("Usá fecha AAAA-MM-DD.") from exc
+
+
+def normalizar_rango(fecha: str | None, desde: str | None, hasta: str | None) -> tuple[str, str]:
+    """Un día (fecha) o un intervalo inclusive (desde/hasta). Máximo 62 días."""
+    if (desde or "").strip() or (hasta or "").strip():
+        a = _fecha_iso((desde or hasta or "").strip())
+        b = _fecha_iso((hasta or desde or "").strip())
+        if b < a:
+            a, b = b, a
+        span = (datetime.strptime(b, "%Y-%m-%d").date() - datetime.strptime(a, "%Y-%m-%d").date()).days
+        if span > MAX_DIAS_RANGO:
+            raise FechaInvalida("El rango no puede pasar de 62 días.")
+        return a, b
+    if fecha:
+        dia = _fecha_iso(fecha.strip())
+        return dia, dia
+    hoy = datetime.now(TZ).date().isoformat()
+    return hoy, hoy
+
+
+def dias_habiles(desde: str, hasta: str) -> list[str]:
+    """Lunes a viernes. Si piden un solo día, ese día aunque sea fin de semana."""
+    cur = datetime.strptime(desde, "%Y-%m-%d").date()
+    end = datetime.strptime(hasta, "%Y-%m-%d").date()
+    todos: list[str] = []
+    habiles: list[str] = []
+    while cur <= end:
+        iso = cur.isoformat()
+        todos.append(iso)
+        if cur.weekday() < 5:
+            habiles.append(iso)
+        cur += timedelta(days=1)
+    if desde == hasta:
+        return todos
+    return habiles or todos
+
+
+def _conteo_periodo(por_dia: dict[str, dict[str, Any]], dias: list[str]) -> dict[str, Any]:
+    estados = [(por_dia.get(dia) or {}).get("estado") for dia in dias]
+    return {
+        "presentes": estados.count("presente"),
+        "tardes": estados.count("tarde"),
+        "ausentes": estados.count("ausente"),
+        "fechasAusente": [dia for dia in dias if (por_dia.get(dia) or {}).get("estado") == "ausente"],
+    }
+
+
+def _alumno_periodo(persona: Any, dias: list[str], hora_corte: str | None = None) -> dict[str, Any]:
+    por_dia: dict[str, dict[str, Any]] = {}
+    ficha: dict[str, Any] | None = None
+    for dia in dias:
+        inicio, fin = _rango_dia(dia)
+        item = _alumno_asistencia(persona, inicio, fin, hora_corte)
+        if ficha is None:
+            ficha = item
+        por_dia[dia] = {"horaMarca": item["horaMarca"], "estado": item["estado"]}
+    assert ficha is not None
+    return {
+        "id": ficha["id"],
+        "nombre": ficha["nombre"],
+        "cui": ficha["cui"],
+        "employeeNo": ficha["employeeNo"],
+        "gradoId": ficha["gradoId"],
+        "grado": ficha["grado"],
+        "encargado": ficha["encargado"],
+        "telefonoEncargado": ficha["telefonoEncargado"],
+        "porDia": por_dia,
+        **_conteo_periodo(por_dia, dias),
+    }
+
+
+def _maestro_periodo(persona: Any, dias: list[str]) -> dict[str, Any]:
+    por_dia: dict[str, dict[str, Any]] = {}
+    ficha: dict[str, Any] | None = None
+    for dia in dias:
+        inicio, fin = _rango_dia(dia)
+        item = _maestro_asistencia(persona, inicio, fin)
+        if ficha is None:
+            ficha = item
+        por_dia[dia] = {
+            "horaEntrada": item["horaEntrada"],
+            "horaSalida": item["horaSalida"],
+            "estado": item["estado"],
+        }
+    assert ficha is not None
+    return {
+        "id": ficha["id"],
+        "nombre": ficha["nombre"],
+        "cargo": ficha["cargo"],
+        "porDia": por_dia,
+        "sinSalida": sum(
+            1
+            for dia in dias
+            if por_dia[dia]["estado"] != "ausente" and not por_dia[dia]["horaSalida"]
+        ),
+        **_conteo_periodo(por_dia, dias),
+    }
+
+
 async def _personas_del_dia(db: Prisma, rol: str, inicio: datetime, fin: datetime) -> list[Any]:
     return await db.persona.find_many(
         where={"activo": True, "rol": rol},
@@ -169,6 +280,7 @@ def _alumno_asistencia(
 def _maestro_asistencia(persona: Any, inicio: datetime, fin: datetime) -> dict[str, Any]:
     marcajes = persona.marcajes or []
     entrada = _primera_entrada(marcajes, inicio, fin)
+    salida = _ultima_salida(marcajes, inicio, fin)
     hora_entrada = _hora_hhmm(entrada) if entrada else None
     detalle = getattr(persona, "detalleCatedratico", None)
     return {
@@ -176,6 +288,7 @@ def _maestro_asistencia(persona: Any, inicio: datetime, fin: datetime) -> dict[s
         "nombre": persona.nombre,
         "cargo": (detalle.cargo if detalle else None) or "Docente",
         "horaEntrada": hora_entrada,
+        "horaSalida": _hora_hhmm(salida) if salida else None,
         "estado": estado_por_hora(hora_entrada, HORA_LIMITE_TARDE_MAESTROS),
     }
 
@@ -327,10 +440,12 @@ async def armar_propia(db: Prisma, fecha: str, persona_id: int) -> dict[str, Any
         hoy = _maestro_asistencia(persona, inicio, fin)
         detalle = hoy.get("cargo") or "Docente"
         hora = hoy.get("horaEntrada")
+        hora_salida = hoy.get("horaSalida")
     else:
         hoy = _alumno_asistencia(persona, inicio, fin)
         detalle = hoy.get("grado") or ""
         hora = hoy.get("horaMarca")
+        hora_salida = None
 
     desde = inicio - timedelta(days=13)
     recientes = await db.asistencia.find_many(
@@ -350,6 +465,7 @@ async def armar_propia(db: Prisma, fecha: str, persona_id: int) -> dict[str, Any
         },
         "hoy": {
             "horaMarca": hora,
+            "horaSalida": hora_salida,
             "estado": hoy["estado"],
         },
         "marcajes": [
@@ -386,3 +502,84 @@ async def armar_maestros(db: Prisma, fecha: str) -> dict[str, Any]:
         },
         "maestros": maestros,
     }
+
+
+async def armar_dashboard_periodo(db: Prisma, desde: str, hasta: str) -> dict[str, Any]:
+    dias = dias_habiles(desde, hasta)
+    inicio, _ = _rango_dia(desde)
+    _, fin = _rango_dia(hasta)
+    alumnos_p = await _personas_del_dia(db, "ALUMNO", inicio, fin)
+    maestros_p = await _personas_del_dia(db, "CATEDRATICO", inicio, fin)
+    filas = []
+    for dia in dias:
+        ini, fin_d = _rango_dia(dia)
+        alumnos = [_alumno_asistencia(item, ini, fin_d) for item in alumnos_p]
+        maestros = [_maestro_asistencia(item, ini, fin_d) for item in maestros_p]
+        filas.append(
+            {
+                "fecha": dia,
+                "alumnos": totales_de(alumnos),
+                "maestros": {
+                    "total": len(maestros),
+                    "presentes": sum(1 for item in maestros if item["estado"] == "presente"),
+                    "tardes": sum(1 for item in maestros if item["estado"] == "tarde"),
+                    "ausentes": sum(1 for item in maestros if item["estado"] == "ausente"),
+                },
+            }
+        )
+    return {"desde": desde, "hasta": hasta, "dias": dias, "filas": filas}
+
+
+async def armar_asistencia_periodo(
+    db: Prisma, desde: str, hasta: str, grado_id: str | None = None
+) -> dict[str, Any]:
+    dias = dias_habiles(desde, hasta)
+    inicio, _ = _rango_dia(desde)
+    _, fin = _rango_dia(hasta)
+    grados = await catalogo_grados(db)
+    alumnos = [_alumno_periodo(item, dias) for item in await _personas_del_dia(db, "ALUMNO", inicio, fin)]
+    etiqueta = "Todas las secciones"
+    if grado_id:
+        alumnos = [item for item in alumnos if item["gradoId"] == grado_id]
+        grado = next((item for item in grados if item["id"] == grado_id), None)
+        etiqueta = grado["etiqueta"] if grado else grado_id
+    return {
+        "desde": desde,
+        "hasta": hasta,
+        "dias": dias,
+        "gradoId": grado_id,
+        "grado": etiqueta,
+        "alumnos": alumnos,
+    }
+
+
+async def armar_ausencias_periodo(db: Prisma, desde: str, hasta: str, hora_corte: str) -> dict[str, Any]:
+    dias = dias_habiles(desde, hasta)
+    inicio, _ = _rango_dia(desde)
+    _, fin = _rango_dia(hasta)
+    filas: list[dict[str, Any]] = []
+    for persona in await _personas_del_dia(db, "ALUMNO", inicio, fin):
+        for dia in dias:
+            ini, fin_d = _rango_dia(dia)
+            item = _alumno_asistencia(persona, ini, fin_d, hora_corte)
+            if item["estado"] == "ausente":
+                filas.append({**item, "fecha": dia})
+    filas.sort(key=lambda item: (item["fecha"], item["grado"], item["nombre"]))
+    return {
+        "desde": desde,
+        "hasta": hasta,
+        "dias": dias,
+        "horaCorte": hora_corte,
+        "alumnos": filas,
+        "totalAusentes": len(filas),
+    }
+
+
+async def armar_maestros_periodo(db: Prisma, desde: str, hasta: str) -> dict[str, Any]:
+    dias = dias_habiles(desde, hasta)
+    inicio, _ = _rango_dia(desde)
+    _, fin = _rango_dia(hasta)
+    maestros = [
+        _maestro_periodo(item, dias) for item in await _personas_del_dia(db, "CATEDRATICO", inicio, fin)
+    ]
+    return {"desde": desde, "hasta": hasta, "dias": dias, "maestros": maestros}

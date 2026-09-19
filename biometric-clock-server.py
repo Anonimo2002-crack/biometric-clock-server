@@ -54,10 +54,15 @@ from exportes import (
     armar_excel,
     armar_pdf,
     asistencia_filas,
+    asistencia_periodo_filas,
     asistencia_secciones_filas,
     ausencias_filas,
+    ausencias_periodo_filas,
     dashboard_filas,
+    dashboard_periodo_filas,
     maestros_filas,
+    maestros_periodo_filas,
+    subtitulo_periodo,
 )
 from hikvision import (
     MINOR_CLAVE_OK,
@@ -72,14 +77,20 @@ from hikvision import (
 from reportes import (
     HORA_LIMITE_TARDE_ALUMNOS,
     HORA_LIMITE_TARDE_MAESTROS,
+    FechaInvalida,
     armar_asistencia_grado,
+    armar_asistencia_periodo,
     armar_asistencia_secciones,
     armar_ausencias,
+    armar_ausencias_periodo,
     armar_dashboard,
+    armar_dashboard_periodo,
     armar_maestros,
+    armar_maestros_periodo,
     armar_propia,
     catalogo_grados,
     estado_por_hora,
+    normalizar_rango,
 )
 from seed import seed_catalogos, seed_demo_si_vacio
 from zoneinfo import ZoneInfo
@@ -110,6 +121,8 @@ CORS_ORIGINS = [item.strip() for item in os.getenv("CORS_ORIGINS", "*").split(",
 
 
 def device_ips() -> list[str]:
+    if os.getenv("SIN_RELOJ", "").strip().lower() in {"1", "true", "yes"}:
+        return []
     ips = [DEVICE_IP]
     if DEVICE_IP_2 and DEVICE_IP_2 not in ips:
         ips.append(DEVICE_IP_2)
@@ -258,9 +271,12 @@ async def lifespan(_app: FastAPI):
     if os.getenv("SEED_DEMO", "").strip().lower() in {"1", "true", "yes"}:
         await seed_demo_si_vacio(db)
 
-    tarea = asyncio.create_task(_sync_automatico()) if SYNC_AUTO_MIN > 0 else None
+    tarea = asyncio.create_task(_sync_automatico()) if SYNC_AUTO_MIN > 0 and device_ips() else None
     if tarea is None:
-        print("AVISO: el sync automático está apagado (SYNC_AUTO_MIN=0).")
+        if not device_ips():
+            print("AVISO: SIN_RELOJ=true. El tablero corre sin hablar con los Hikvision.")
+        else:
+            print("AVISO: el sync automático está apagado (SYNC_AUTO_MIN=0).")
     tarea_correo = asyncio.create_task(_correo_automatico())
     ajustes = leer_ajustes()
     print(
@@ -319,6 +335,7 @@ class LoginOut(BaseModel):
     nombre: str
     usuario: str
     rol: str
+    cargo: str
     personaId: int | None = None
 
 
@@ -336,6 +353,7 @@ class UsuarioOut(BaseModel):
     nombre: str
     usuario: str
     rol: str
+    cargo: str | None = None
     activo: bool
     personaId: int | None = None
     personaNombre: str | None = None
@@ -546,6 +564,19 @@ def _fecha_query(fecha: str | None) -> str:
     return fecha or datetime.now(TZ).date().isoformat()
 
 
+def _rango_query(
+    fecha: str | None, desde: str | None = None, hasta: str | None = None
+) -> tuple[str, str]:
+    try:
+        return normalizar_rango(fecha, desde, hasta)
+    except FechaInvalida as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+def _nombre_archivo(prefijo: str, desde: str, hasta: str) -> str:
+    return f"{prefijo}-{desde}" if desde == hasta else f"{prefijo}-{desde}_{hasta}"
+
+
 def _nombre_minor(minor: int) -> str:
     conocidos = {
         MINOR_ROSTRO_OK: "rostro reconocido",
@@ -615,6 +646,34 @@ def _validar_rol_sistema(rol: str) -> str:
             detail=f"rol del sistema: {', '.join(ROLES_SISTEMA)}",
         )
     return limpio
+
+
+_ETIQUETA_ROL = {
+    "ADMIN": "Administrador",
+    "DIRECCION": "Dirección",
+    "SECRETARIA": "Secretaría",
+    "DOCENTE": "Docente",
+    "PROPIO": "Consulta propia",
+}
+
+
+async def _cargo_sesion(fila: Any) -> str:
+    """Cargo de matrícula si la cuenta es de un maestro; si no, el nombre del rol."""
+    persona = None
+    persona_id = getattr(fila, "personaId", None)
+    if persona_id:
+        persona = await db.persona.find_unique(
+            where={"id": persona_id},
+            include={"detalleCatedratico": True},
+        )
+    if persona is None:
+        persona = await db.persona.find_first(
+            where={"nombre": fila.nombre, "rol": "CATEDRATICO", "activo": True},
+            include={"detalleCatedratico": True},
+        )
+    detalle = getattr(persona, "detalleCatedratico", None) if persona else None
+    cargo = (getattr(detalle, "cargo", None) or "").strip()
+    return cargo or _ETIQUETA_ROL.get(getattr(fila, "rol", ""), fila.rol)
 
 
 # Numeración del reloj. Va aparte por rol para que alumnos y personal no
@@ -1101,17 +1160,22 @@ def _archivo_reporte(
     if formato not in {"pdf", "xlsx"}:
         raise HTTPException(status_code=400, detail="formato: pdf o xlsx")
     if formato == "pdf":
-        cuerpo = armar_pdf(titulo, subtitulo, encabezados, filas)
-        media = "application/pdf"
+        try:
+            cuerpo = armar_pdf(titulo, subtitulo, encabezados, filas)
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"No se pudo armar el PDF: {exc}") from exc
         archivo = f"{nombre}.pdf"
     else:
         cuerpo = armar_excel(titulo, subtitulo, encabezados, filas)
-        media = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         archivo = f"{nombre}.xlsx"
     return Response(
         content=cuerpo,
-        media_type=media,
-        headers={"Content-Disposition": f'attachment; filename="{archivo}"'},
+        media_type="application/octet-stream",
+        headers={
+            "Content-Disposition": f'attachment; filename="{archivo}"',
+            "X-Content-Type-Options": "nosniff",
+            "Cache-Control": "no-store",
+        },
     )
 
 
@@ -1149,14 +1213,15 @@ async def login(payload: LoginIn, request: Request) -> LoginOut:
         nombre=fila.nombre,
         usuario=fila.usuario,
         rol=fila.rol,
-        personaId=fila.personaId,
+        cargo=await _cargo_sesion(fila),
+        personaId=getattr(fila, "personaId", None),
     )
 
 
 @app.get("/api/auth/me", response_model=UsuarioOut)
 async def me(usuario: Any = Depends(usuario_actual)) -> UsuarioOut:
-    fila = await db.usuario.find_unique(where={"id": usuario.id}, include={"persona": True})
-    return _usuario_out(fila or usuario)
+    fila = await db.usuario.find_unique(where={"id": usuario.id})
+    return await _usuario_out(fila or usuario)
 
 
 @app.post("/api/auth/cambiar-clave")
@@ -1175,15 +1240,16 @@ async def cambiar_clave(payload: ClaveIn, usuario: Any = Depends(usuario_actual)
 # --- usuarios del sistema ---
 
 
-def _usuario_out(fila: Any) -> UsuarioOut:
+async def _usuario_out(fila: Any) -> UsuarioOut:
     persona = getattr(fila, "persona", None)
     return UsuarioOut(
         id=fila.id,
         nombre=fila.nombre,
         usuario=fila.usuario,
         rol=fila.rol,
+        cargo=await _cargo_sesion(fila),
         activo=fila.activo,
-        personaId=fila.personaId,
+        personaId=getattr(fila, "personaId", None),
         personaNombre=persona.nombre if persona else None,
     )
 
@@ -1207,8 +1273,8 @@ async def _persona_de_consulta(rol: str, persona_id: int | None) -> int | None:
 
 @app.get("/api/usuarios", response_model=list[UsuarioOut])
 async def listar_usuarios(_: Any = Depends(require_roles(*ROLES_USUARIOS))) -> list[UsuarioOut]:
-    filas = await db.usuario.find_many(include={"persona": True}, order={"nombre": "asc"})
-    return [_usuario_out(fila) for fila in filas]
+    filas = await db.usuario.find_many(order={"nombre": "asc"})
+    return [await _usuario_out(fila) for fila in filas]
 
 
 @app.post("/api/usuarios", response_model=UsuarioOut)
@@ -1227,11 +1293,10 @@ async def crear_usuario(payload: UsuarioIn, _: Any = Depends(require_roles(*ROLE
                 "activo": payload.activo,
                 "personaId": persona_id,
             },
-            include={"persona": True},
         )
     except UniqueViolationError as exc:
         raise HTTPException(status_code=409, detail="Ese usuario ya existe.") from exc
-    return _usuario_out(fila)
+    return await _usuario_out(fila)
 
 
 @app.put("/api/usuarios/{usuario_id}", response_model=UsuarioOut)
@@ -1256,10 +1321,10 @@ async def editar_usuario(
             raise HTTPException(status_code=400, detail="La contraseña debe tener al menos 6 caracteres.")
         data["passwordHash"] = hash_password(payload.password.strip())
     try:
-        fila = await db.usuario.update(where={"id": usuario_id}, data=data, include={"persona": True})
+        fila = await db.usuario.update(where={"id": usuario_id}, data=data)
     except UniqueViolationError as exc:
         raise HTTPException(status_code=409, detail="Ese usuario ya existe.") from exc
-    return _usuario_out(fila)
+    return await _usuario_out(fila)
 
 
 @app.delete("/api/usuarios/{usuario_id}", response_model=UsuarioOut)
@@ -1273,7 +1338,7 @@ async def baja_usuario(
     if actual is None:
         raise HTTPException(status_code=404, detail="Usuario no encontrado.")
     fila = await db.usuario.update(where={"id": usuario_id}, data={"activo": False})
-    return UsuarioOut.model_validate(fila)
+    return await _usuario_out(fila)
 
 
 # --- dispositivo ---
@@ -1649,10 +1714,14 @@ async def borrar_rostros(
     def borrar(ip: str) -> None:
         hikvision(ip).delete_face(persona.employeeNo)
 
+    dispositivos = await _en_cada_reloj(borrar)
+    if not any(item.ok for item in dispositivos):
+        detalle = dispositivos[0].detalle if dispositivos else "No hay relojes configurados."
+        raise HTTPException(status_code=502, detail=detalle)
     return EnrolarResult(
         employeeNo=persona.employeeNo,
         nombre=persona.nombre,
-        dispositivos=await _en_cada_reloj(borrar),
+        dispositivos=dispositivos,
     )
 
 
@@ -1666,10 +1735,14 @@ async def borrar_huellas(
     def borrar(ip: str) -> None:
         hikvision(ip).delete_fingerprints(persona.employeeNo)
 
+    dispositivos = await _en_cada_reloj(borrar)
+    if not any(item.ok for item in dispositivos):
+        detalle = dispositivos[0].detalle if dispositivos else "No hay relojes configurados."
+        raise HTTPException(status_code=502, detail=detalle)
     return EnrolarResult(
         employeeNo=persona.employeeNo,
         nombre=persona.nombre,
-        dispositivos=await _en_cada_reloj(borrar),
+        dispositivos=dispositivos,
     )
 
 
@@ -1938,17 +2011,23 @@ async def get_mi_asistencia(
 @app.get("/api/exportar/dashboard")
 async def exportar_dashboard(
     fecha: str | None = Query(default=None),
+    desde: str | None = Query(default=None),
+    hasta: str | None = Query(default=None),
     formato: Literal["pdf", "xlsx"] = "pdf",
     _: Any = Depends(require_roles(*ROLES_EXPORTAR)),
 ) -> Response:
-    dia = _fecha_query(fecha)
-    dto = await armar_dashboard(db, dia)
-    encabezados, filas = dashboard_filas(dto)
+    a, b = _rango_query(fecha, desde, hasta)
+    if a == b:
+        dto = await armar_dashboard(db, a)
+        encabezados, filas = dashboard_filas(dto)
+    else:
+        dto = await armar_dashboard_periodo(db, a, b)
+        encabezados, filas = dashboard_periodo_filas(dto)
     return _archivo_reporte(
         formato,
-        f"tablero-{dia}",
+        _nombre_archivo("tablero", a, b),
         "Tablero de asistencia",
-        dia,
+        subtitulo_periodo(a, b),
         encabezados,
         filas,
     )
@@ -1958,20 +2037,28 @@ async def exportar_dashboard(
 async def exportar_asistencia_grados(
     gradoId: str = Query(...),
     fecha: str | None = Query(default=None),
+    desde: str | None = Query(default=None),
+    hasta: str | None = Query(default=None),
     formato: Literal["pdf", "xlsx"] = "pdf",
     _: Any = Depends(require_roles(*ROLES_EXPORTAR)),
 ) -> Response:
-    dia = _fecha_query(fecha)
     ids = {item["id"] for item in await catalogo_grados(db)}
     if gradoId not in ids:
         raise HTTPException(status_code=400, detail=f"gradoId inválido. Usa: {sorted(ids)}")
-    dto = await armar_asistencia_grado(db, dia, gradoId)
-    encabezados, filas = asistencia_filas(dto)
+    a, b = _rango_query(fecha, desde, hasta)
+    if a == b:
+        dto = await armar_asistencia_grado(db, a, gradoId)
+        encabezados, filas = asistencia_filas(dto)
+        titulo = f"Reporte {dto['grado']}"
+    else:
+        dto = await armar_asistencia_periodo(db, a, b, gradoId)
+        encabezados, filas = asistencia_periodo_filas(dto, formato)
+        titulo = f"Reporte {dto['grado']}"
     return _archivo_reporte(
         formato,
-        f"asistencia-{gradoId}-{dia}",
-        f"Reporte {dto['grado']}",
-        dia,
+        _nombre_archivo(f"asistencia-{gradoId}", a, b),
+        titulo,
+        subtitulo_periodo(a, b),
         encabezados,
         filas,
     )
@@ -1980,17 +2067,23 @@ async def exportar_asistencia_grados(
 @app.get("/api/exportar/asistencia-secciones")
 async def exportar_asistencia_secciones(
     fecha: str | None = Query(default=None),
+    desde: str | None = Query(default=None),
+    hasta: str | None = Query(default=None),
     formato: Literal["pdf", "xlsx"] = "pdf",
     _: Any = Depends(require_roles(*ROLES_EXPORTAR)),
 ) -> Response:
-    dia = _fecha_query(fecha)
-    dto = await armar_asistencia_secciones(db, dia)
-    encabezados, filas = asistencia_secciones_filas(dto)
+    a, b = _rango_query(fecha, desde, hasta)
+    if a == b:
+        dto = await armar_asistencia_secciones(db, a)
+        encabezados, filas = asistencia_secciones_filas(dto)
+    else:
+        dto = await armar_asistencia_periodo(db, a, b)
+        encabezados, filas = asistencia_periodo_filas(dto, formato)
     return _archivo_reporte(
         formato,
-        f"asistencia-secciones-{dia}",
+        _nombre_archivo("asistencia-secciones", a, b),
         "Reporte de asistencia por sección",
-        dia,
+        subtitulo_periodo(a, b),
         encabezados,
         filas,
     )
@@ -1999,20 +2092,26 @@ async def exportar_asistencia_secciones(
 @app.get("/api/exportar/ausencias")
 async def exportar_ausencias(
     fecha: str | None = Query(default=None),
+    desde: str | None = Query(default=None),
+    hasta: str | None = Query(default=None),
     horaCorte: str = Query("13:15"),
     formato: Literal["pdf", "xlsx"] = "pdf",
     _: Any = Depends(require_roles(*ROLES_EXPORTAR)),
 ) -> Response:
     if horaCorte not in HORAS_CORTE_VALIDAS:
         raise HTTPException(status_code=400, detail="horaCorte inválida")
-    dia = _fecha_query(fecha)
-    dto = await armar_ausencias(db, dia, horaCorte)
-    encabezados, filas = ausencias_filas(dto)
+    a, b = _rango_query(fecha, desde, hasta)
+    if a == b:
+        dto = await armar_ausencias(db, a, horaCorte)
+        encabezados, filas = ausencias_filas(dto)
+    else:
+        dto = await armar_ausencias_periodo(db, a, b, horaCorte)
+        encabezados, filas = ausencias_periodo_filas(dto)
     return _archivo_reporte(
         formato,
-        f"ausencias-{horaCorte.replace(':', '')}-{dia}",
+        _nombre_archivo(f"ausencias-{horaCorte.replace(':', '')}", a, b),
         f"Ausencias a las {horaCorte}",
-        dia,
+        subtitulo_periodo(a, b),
         encabezados,
         filas,
     )
@@ -2021,17 +2120,23 @@ async def exportar_ausencias(
 @app.get("/api/exportar/maestros")
 async def exportar_maestros(
     fecha: str | None = Query(default=None),
+    desde: str | None = Query(default=None),
+    hasta: str | None = Query(default=None),
     formato: Literal["pdf", "xlsx"] = "pdf",
     _: Any = Depends(require_roles(*ROLES_EXPORTAR)),
 ) -> Response:
-    dia = _fecha_query(fecha)
-    dto = await armar_maestros(db, dia)
-    encabezados, filas = maestros_filas(dto)
+    a, b = _rango_query(fecha, desde, hasta)
+    if a == b:
+        dto = await armar_maestros(db, a)
+        encabezados, filas = maestros_filas(dto)
+    else:
+        dto = await armar_maestros_periodo(db, a, b)
+        encabezados, filas = maestros_periodo_filas(dto, formato)
     return _archivo_reporte(
         formato,
-        f"maestros-{dia}",
+        _nombre_archivo("maestros", a, b),
         "Asistencia de maestros",
-        dia,
+        subtitulo_periodo(a, b),
         encabezados,
         filas,
     )
