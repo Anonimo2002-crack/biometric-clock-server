@@ -471,23 +471,32 @@ class HikvisionClient:
             valor = item.get("fingerPrintID") or item.get("fingerNo")
             if valor is not None and str(valor).isdigit():
                 ids.append(int(valor))
-        return ids or None
+        return ids
 
-    def _huellas_restantes(self, employee_no: str) -> int:
-        time.sleep(0.4)
+    def _huellas_de_persona(self, employee_no: str, fila: dict[str, Any] | None = None) -> int:
+        """Solo las huellas de este número. El Count del aparato a veces tira el total."""
         ids = self._ids_huella(employee_no)
         if ids is not None:
             return len(ids)
-        fila = self.buscar_usuario(employee_no) or {}
-        en_ficha = int(fila.get("numOfFP") or fila.get("fingerPrintNum") or 0)
-        if 0 <= en_ficha <= 10:
-            return en_ficha
+        ficha = fila or {}
+        for clave in ("numOfFP", "fingerPrintNum", "numOfFingerPrint"):
+            if ficha.get(clave) is None:
+                continue
+            try:
+                valor = int(ficha.get(clave) or 0)
+            except (TypeError, ValueError):
+                continue
+            if 0 <= valor <= 10:
+                return valor
         try:
             total = self.count_fingerprints(employee_no)
         except HikvisionError:
-            return en_ficha
-        # Más de 10 suele ser el total del aparato, no el de esta persona.
-        return total if total <= 10 else en_ficha
+            return 0
+        return total if 0 <= total <= 10 else 0
+
+    def _huellas_restantes(self, employee_no: str) -> int:
+        time.sleep(0.4)
+        return self._huellas_de_persona(employee_no)
 
     def buscar_usuario(self, employee_no: str) -> dict[str, Any] | None:
         cuerpo = {
@@ -516,10 +525,7 @@ class HikvisionClient:
         fila = self.buscar_usuario(employee_no)
         if fila is None:
             raise HikvisionError(f"El {employee_no} no está grabado en {self.ip}.")
-        try:
-            huellas = self.count_fingerprints(employee_no)
-        except HikvisionError:
-            huellas = int(fila.get("numOfFP") or fila.get("fingerPrintNum") or 0)
+        huellas = self._huellas_de_persona(employee_no, fila)
         try:
             caras = self.count_faces(employee_no)
         except HikvisionError:
