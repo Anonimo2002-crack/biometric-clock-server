@@ -208,33 +208,41 @@ async def _seed_usuario_admin() -> None:
 
 
 async def _sync_automatico() -> None:
-    """Baja hoy seguido. Los días atrás se recogen después, sin tapar el tablero."""
+    """Un ciclo por reloj. A no espera a B ni B a A."""
+    if SYNC_AUTO_DIAS > 1:
+        asyncio.create_task(_catchup_dias_anteriores())
+    await asyncio.gather(*[_loop_reloj(ip) for ip in device_ips()])
+
+
+async def _loop_reloj(ip: str) -> None:
     primera = True
-    catchup_lanzado = False
     while True:
         try:
-            hoy = datetime.now(TZ).date().isoformat()
-            minutos = None if primera else SYNC_RECIENTE_MIN
-            dispositivos = await _bajar_marcajes(hoy, 1, minutos=minutos)
-            for item in dispositivos:
-                if item.nuevos:
-                    print(
-                        f"Sync automático: {item.nuevos} marcaje(s) de {item.dispositivoIp}.",
-                        flush=True,
-                    )
+            ahora = datetime.now(TZ)
+            dia = ahora.date().isoformat()
+            inicio, fin, _ = _inicio_fin_dia(dia)
+            if primera:
+                inicio_fetch, fin_fetch = inicio, fin
+            else:
+                inicio_fetch = max(inicio, ahora - timedelta(minutes=SYNC_RECIENTE_MIN))
+                fin_fetch = min(fin, ahora + timedelta(minutes=1))
+            item = await _sincronizar_un_reloj(ip, inicio_fetch, fin_fetch, inicio, fin, dia)
+            if item.nuevos:
+                print(
+                    f"Sync automático: {item.nuevos} marcaje(s) de {ip}.",
+                    flush=True,
+                )
             primera = False
-            if not catchup_lanzado and SYNC_AUTO_DIAS > 1:
-                catchup_lanzado = True
-                asyncio.create_task(_catchup_dias_anteriores())
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - no debe tumbar el servidor
-            print(f"Sync automático falló: {exc}", flush=True)
+            print(f"Sync {ip} falló: {exc}", flush=True)
         await asyncio.sleep(SYNC_AUTO_SEG)
 
 
 async def _catchup_dias_anteriores() -> None:
-    """Recoge ayer y anteayer de a un día, sin bloquear la lectura de hoy."""
+    """Recoge ayer y anteayer de a un día, sin tapar el sync de hoy."""
+    await asyncio.sleep(30)
     hoy = datetime.now(TZ).date()
     for atras in range(1, SYNC_AUTO_DIAS):
         try:
