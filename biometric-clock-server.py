@@ -110,19 +110,19 @@ DEVICE_PASS = os.getenv("DEVICE_PASS", "")
 DEVICE_USER_2 = os.getenv("DEVICE_USER_2", "").strip() or DEVICE_USER
 DEVICE_PASS_2 = os.getenv("DEVICE_PASS_2", "") or DEVICE_PASS
 DEVICE_TIMEOUT = int(os.getenv("DEVICE_TIMEOUT", "10"))
-# Cada cuántos segundos bajar los marcajes solo. 20 s es suficiente para que
-# el tablero se mueva en jornada sin esperar el botón. 0 lo apaga.
-# Si solo está SYNC_AUTO_MIN, se usa ese valor en minutos.
+# Cada cuántos segundos bajar los marcajes de hoy. 8 s se siente en vivo.
+# 0 lo apaga. Si solo está SYNC_AUTO_MIN, se usa ese valor en minutos.
 if os.getenv("SYNC_AUTO_SEG", "").strip():
-    SYNC_AUTO_SEG = int(os.getenv("SYNC_AUTO_SEG", "20"))
+    SYNC_AUTO_SEG = int(os.getenv("SYNC_AUTO_SEG", "8"))
 elif os.getenv("SYNC_AUTO_MIN", "").strip():
     SYNC_AUTO_SEG = int(os.getenv("SYNC_AUTO_MIN", "1")) * 60
 else:
-    SYNC_AUTO_SEG = 20
+    SYNC_AUTO_SEG = 8
 SYNC_AUTO_MIN = max(1, (SYNC_AUTO_SEG + 59) // 60) if SYNC_AUTO_SEG else 0
-# Días que revisa la primera corrida, para recoger lo que quedó en los relojes
-# mientras el servidor estuvo apagado.
+# Días atrás que se recogen en segundo plano, sin tapar el sync de hoy.
 SYNC_AUTO_DIAS = int(os.getenv("SYNC_AUTO_DIAS", "3"))
+# Después de la primera lectura del día, solo se piden estos minutos recientes.
+SYNC_RECIENTE_MIN = int(os.getenv("SYNC_RECIENTE_MIN", "15"))
 _sync_lock = asyncio.Lock()
 _disp_cache: dict[str, int] = {}
 _sync_generacion = 0
@@ -208,26 +208,42 @@ async def _seed_usuario_admin() -> None:
 
 
 async def _sync_automatico() -> None:
-    """Baja los marcajes cada tanto, sin que nadie tenga que acordarse.
-
-    El reloj guarda los eventos, pero si nadie los baja no salen en el tablero.
-    La primera vuelta mira varios días atrás por si el servidor estuvo apagado.
-    """
+    """Baja hoy seguido. Los días atrás se recogen después, sin tapar el tablero."""
     primera = True
+    catchup_lanzado = False
     while True:
         try:
-            dias = SYNC_AUTO_DIAS if primera else 1
             hoy = datetime.now(TZ).date().isoformat()
-            dispositivos = await _bajar_marcajes(hoy, dias)
+            minutos = None if primera else SYNC_RECIENTE_MIN
+            dispositivos = await _bajar_marcajes(hoy, 1, minutos=minutos)
             for item in dispositivos:
                 if item.nuevos:
-                    print(f"Sync automático: {item.nuevos} marcaje(s) de {item.dispositivoIp}.")
+                    print(
+                        f"Sync automático: {item.nuevos} marcaje(s) de {item.dispositivoIp}.",
+                        flush=True,
+                    )
             primera = False
+            if not catchup_lanzado and SYNC_AUTO_DIAS > 1:
+                catchup_lanzado = True
+                asyncio.create_task(_catchup_dias_anteriores())
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - no debe tumbar el servidor
-            print(f"Sync automático falló: {exc}")
+            print(f"Sync automático falló: {exc}", flush=True)
         await asyncio.sleep(SYNC_AUTO_SEG)
+
+
+async def _catchup_dias_anteriores() -> None:
+    """Recoge ayer y anteayer de a un día, sin bloquear la lectura de hoy."""
+    hoy = datetime.now(TZ).date()
+    for atras in range(1, SYNC_AUTO_DIAS):
+        try:
+            dia = (hoy - timedelta(days=atras)).isoformat()
+            await _bajar_marcajes(dia, 1)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            print(f"Catchup {atras} día(s) atrás falló: {exc}", flush=True)
 
 
 def _ultimo_correo_auto() -> str:
@@ -288,7 +304,10 @@ async def lifespan(_app: FastAPI):
         else:
             print("AVISO: el sync automático está apagado (SYNC_AUTO_SEG=0).")
     elif tarea is not None:
-        print(f"Sync automático cada {SYNC_AUTO_SEG} s. Relojes en paralelo.")
+        print(
+            f"Sync automático cada {SYNC_AUTO_SEG} s. Cada reloj se guarda al terminar.",
+            flush=True,
+        )
     tarea_correo = asyncio.create_task(_correo_automatico())
     ajustes = leer_ajustes()
     print(
@@ -1244,34 +1263,56 @@ async def _traer_eventos(
         return ip, [], str(exc)
 
 
-async def _bajar_marcajes(fecha: str | None, dias: int) -> list[SyncDispositivo]:
-    """Lee A y B a la vez; la base se escribe después, uno por uno."""
+async def _sincronizar_un_reloj(
+    ip: str,
+    inicio_fetch: datetime,
+    fin_fetch: datetime,
+    inicio_dia: datetime,
+    fin_dia: datetime,
+    dia: str,
+) -> SyncDispositivo:
+    """Baja un reloj y lo guarda apenas responde, sin esperar al otro."""
+    _ip, eventos, error = await _traer_eventos(ip, inicio_fetch, fin_fetch)
+    if error:
+        print(f"Sync {ip}: {error}", flush=True)
+        return SyncDispositivo(
+            dispositivoIp=ip,
+            consultados=0,
+            nuevos=0,
+            duplicados=0,
+            sinUsuario=0,
+            error=error,
+        )
+    async with _sync_lock:
+        item = await _guardar_eventos(ip, eventos, inicio_dia, fin_dia, dia)
+    _anotar_sync([item])
+    if item.nuevos:
+        print(f"Sync {ip}: {item.nuevos} nuevo(s) de {item.consultados} leído(s).", flush=True)
+    return item
+
+
+async def _bajar_marcajes(
+    fecha: str | None, dias: int, minutos: int | None = None
+) -> list[SyncDispositivo]:
+    """Lee A y B a la vez. El que termina primero ya pinta el tablero."""
     _inicio, _fin, dia_final = _inicio_fin_dia(fecha)
     ultimo = datetime.strptime(dia_final, "%Y-%m-%d").date()
     primero = ultimo - timedelta(days=max(1, dias) - 1)
     inicio, _, _ = _inicio_fin_dia(primero.isoformat())
     _, fin, _ = _inicio_fin_dia(ultimo.isoformat())
-    async with _sync_lock:
-        descargas = await asyncio.gather(
-            *[_traer_eventos(ip, inicio, fin) for ip in device_ips()]
+    inicio_fetch, fin_fetch = inicio, fin
+    if minutos:
+        ahora = datetime.now(TZ)
+        inicio_fetch = max(inicio, ahora - timedelta(minutes=minutos))
+        fin_fetch = min(fin, ahora + timedelta(minutes=1))
+    return list(
+        await asyncio.gather(
+            *[
+                _sincronizar_un_reloj(ip, inicio_fetch, fin_fetch, inicio, fin, dia_final)
+                for ip in device_ips()
+            ]
         )
-        resultado: list[SyncDispositivo] = []
-        for ip, eventos, error in descargas:
-            if error:
-                resultado.append(
-                    SyncDispositivo(
-                        dispositivoIp=ip,
-                        consultados=0,
-                        nuevos=0,
-                        duplicados=0,
-                        sinUsuario=0,
-                        error=error,
-                    )
-                )
-                continue
-            resultado.append(await _guardar_eventos(ip, eventos, inicio, fin, dia_final))
-        _anotar_sync(resultado)
-        return resultado
+    )
 
 
 async def _guardar_eventos(
