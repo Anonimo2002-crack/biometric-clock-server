@@ -743,10 +743,11 @@ class HikvisionClient:
         position: int = 0,
         max_results: int = 50,
         minor: int = MINOR_TODOS,
+        search_id: str | None = None,
     ) -> dict[str, Any]:
         body = {
             "AcsEventCond": {
-                "searchID": str(uuid.uuid4()),
+                "searchID": search_id or str(uuid.uuid4()),
                 "searchResultPosition": position,
                 "maxResults": max_results,
                 "major": 5,
@@ -769,12 +770,13 @@ class HikvisionClient:
         start: datetime,
         end: datetime,
         minor: int = MINOR_TODOS,
-        page_size: int = 50,
+        page_size: int = 80,
     ) -> list[dict[str, Any]]:
         events: list[dict[str, Any]] = []
         position = 0
+        search_id = str(uuid.uuid4())
         while True:
-            payload = self.search_events(start, end, position, page_size, minor)
+            payload = self.search_events(start, end, position, page_size, minor, search_id)
             acs = payload.get("AcsEvent") or {}
             info = acs.get("InfoList") or []
             if isinstance(info, dict):

@@ -110,12 +110,24 @@ DEVICE_PASS = os.getenv("DEVICE_PASS", "")
 DEVICE_USER_2 = os.getenv("DEVICE_USER_2", "").strip() or DEVICE_USER
 DEVICE_PASS_2 = os.getenv("DEVICE_PASS_2", "") or DEVICE_PASS
 DEVICE_TIMEOUT = int(os.getenv("DEVICE_TIMEOUT", "10"))
-# Cada cuántos minutos bajar los marcajes solo. En 0 queda apagado y hay que
-# darle al botón del tablero.
-SYNC_AUTO_MIN = int(os.getenv("SYNC_AUTO_MIN", "1"))
+# Cada cuántos segundos bajar los marcajes solo. 20 s es suficiente para que
+# el tablero se mueva en jornada sin esperar el botón. 0 lo apaga.
+# Si solo está SYNC_AUTO_MIN, se usa ese valor en minutos.
+if os.getenv("SYNC_AUTO_SEG", "").strip():
+    SYNC_AUTO_SEG = int(os.getenv("SYNC_AUTO_SEG", "20"))
+elif os.getenv("SYNC_AUTO_MIN", "").strip():
+    SYNC_AUTO_SEG = int(os.getenv("SYNC_AUTO_MIN", "1")) * 60
+else:
+    SYNC_AUTO_SEG = 20
+SYNC_AUTO_MIN = max(1, (SYNC_AUTO_SEG + 59) // 60) if SYNC_AUTO_SEG else 0
 # Días que revisa la primera corrida, para recoger lo que quedó en los relojes
 # mientras el servidor estuvo apagado.
 SYNC_AUTO_DIAS = int(os.getenv("SYNC_AUTO_DIAS", "3"))
+_sync_lock = asyncio.Lock()
+_disp_cache: dict[str, int] = {}
+_sync_generacion = 0
+_sync_ultimo: str | None = None
+_sync_nuevos = 0
 ARCHIVO_CORREO_AUTO = Path(__file__).resolve().parent / ".correo-auto-ultimo"
 # La captura de huella espera a que la persona ponga el dedo en el lector.
 CAPTURA_HUELLA_TIMEOUT = int(os.getenv("CAPTURA_HUELLA_TIMEOUT", "30"))
@@ -205,19 +217,17 @@ async def _sync_automatico() -> None:
     while True:
         try:
             dias = SYNC_AUTO_DIAS if primera else 1
-            hoy = datetime.now(TZ).date()
-            for atras in range(dias):
-                inicio, fin, dia = _inicio_fin_dia((hoy - timedelta(days=atras)).isoformat())
-                for ip in device_ips():
-                    resultado = await _sincronizar_ip(ip, inicio, fin, dia)
-                    if resultado.nuevos:
-                        print(f"Sync automático: {resultado.nuevos} marcaje(s) de {ip} el {dia}.")
+            hoy = datetime.now(TZ).date().isoformat()
+            dispositivos = await _bajar_marcajes(hoy, dias)
+            for item in dispositivos:
+                if item.nuevos:
+                    print(f"Sync automático: {item.nuevos} marcaje(s) de {item.dispositivoIp}.")
             primera = False
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - no debe tumbar el servidor
             print(f"Sync automático falló: {exc}")
-        await asyncio.sleep(SYNC_AUTO_MIN * 60)
+        await asyncio.sleep(SYNC_AUTO_SEG)
 
 
 def _ultimo_correo_auto() -> str:
@@ -245,9 +255,7 @@ async def _correo_automatico() -> None:
                 and (ahora.hour * 60 + ahora.minute) >= minutos_de(hora_envio)
                 and _ultimo_correo_auto() != dia
             ):
-                inicio, fin, _ = _inicio_fin_dia(dia)
-                for ip in device_ips():
-                    await _sincronizar_ip(ip, inicio, fin, dia)
+                await _bajar_marcajes(dia, 1)
                 dto = await armar_ausencias(db, dia, hora_envio)
                 resultado = await asyncio.to_thread(enviar_ausencias, dto)
                 _marcar_correo_auto(dia)
@@ -273,12 +281,14 @@ async def lifespan(_app: FastAPI):
     if os.getenv("SEED_DEMO", "").strip().lower() in {"1", "true", "yes"}:
         await seed_demo_si_vacio(db)
 
-    tarea = asyncio.create_task(_sync_automatico()) if SYNC_AUTO_MIN > 0 and device_ips() else None
+    tarea = asyncio.create_task(_sync_automatico()) if SYNC_AUTO_SEG > 0 and device_ips() else None
     if tarea is None:
         if not device_ips():
             print("AVISO: SIN_RELOJ=true. El tablero corre sin hablar con los Hikvision.")
         else:
-            print("AVISO: el sync automático está apagado (SYNC_AUTO_MIN=0).")
+            print("AVISO: el sync automático está apagado (SYNC_AUTO_SEG=0).")
+    elif tarea is not None:
+        print(f"Sync automático cada {SYNC_AUTO_SEG} s. Relojes en paralelo.")
     tarea_correo = asyncio.create_task(_correo_automatico())
     ajustes = leer_ajustes()
     print(
@@ -526,6 +536,13 @@ class SyncResult(BaseModel):
     duplicados: int
     sinUsuario: int = Field(description="Eventos con employeeNo que no estaba en la BD")
     ignorados: int = Field(default=0, description="Eventos que no son un marcaje válido")
+
+
+class SyncEstado(BaseModel):
+    generacion: int
+    ultimo: str | None = None
+    nuevos: int = 0
+    intervaloSeg: int = 20
 
 
 class MarcaCodigoIn(BaseModel):
@@ -1044,10 +1061,13 @@ async def _guardar_detalles(
 
 async def _dispositivo_id(ip: str) -> int:
     """Busca el reloj por IP y lo da de alta si es uno que aún no estaba."""
+    if ip in _disp_cache:
+        return _disp_cache[ip]
     fila = await db.dispositivo.upsert(
         where={"ip": ip},
         data={"create": {"ip": ip, "nombre": f"Reloj {ip}"}, "update": {}},
     )
+    _disp_cache[ip] = fila.id
     return fila.id
 
 
@@ -1202,28 +1222,64 @@ async def _despachar_llegadas(pendientes: list[dict[str, Any]], dia: str) -> Non
     )
 
 
-async def _sincronizar_ip(ip: str, inicio: datetime, fin: datetime, dia: str) -> SyncDispositivo:
-    inicio_busqueda = (inicio - timedelta(days=1)).replace(tzinfo=None)
-    fin_busqueda = (fin + timedelta(days=1)).replace(tzinfo=None)
-    try:
-        eventos = hikvision(ip).fetch_all_events(inicio_busqueda, fin_busqueda)
-    except HikvisionError as exc:
-        return SyncDispositivo(
-            dispositivoIp=ip,
-            consultados=0,
-            nuevos=0,
-            duplicados=0,
-            sinUsuario=0,
-            error=str(exc),
-        )
+def _anotar_sync(dispositivos: list[SyncDispositivo]) -> None:
+    global _sync_generacion, _sync_ultimo, _sync_nuevos
+    _sync_ultimo = datetime.now(TZ).isoformat()
+    _sync_nuevos = sum(item.nuevos for item in dispositivos)
+    if _sync_nuevos:
+        _sync_generacion += 1
 
-    nuevos = 0
-    duplicados = 0
-    creados_al_vuelo = 0
+
+async def _traer_eventos(
+    ip: str, inicio: datetime, fin: datetime
+) -> tuple[str, list[dict[str, Any]], str | None]:
+    try:
+        eventos = await asyncio.to_thread(
+            hikvision(ip).fetch_all_events,
+            inicio.replace(tzinfo=None),
+            fin.replace(tzinfo=None),
+        )
+        return ip, eventos, None
+    except HikvisionError as exc:
+        return ip, [], str(exc)
+
+
+async def _bajar_marcajes(fecha: str | None, dias: int) -> list[SyncDispositivo]:
+    """Lee A y B a la vez; la base se escribe después, uno por uno."""
+    _inicio, _fin, dia_final = _inicio_fin_dia(fecha)
+    ultimo = datetime.strptime(dia_final, "%Y-%m-%d").date()
+    primero = ultimo - timedelta(days=max(1, dias) - 1)
+    inicio, _, _ = _inicio_fin_dia(primero.isoformat())
+    _, fin, _ = _inicio_fin_dia(ultimo.isoformat())
+    async with _sync_lock:
+        descargas = await asyncio.gather(
+            *[_traer_eventos(ip, inicio, fin) for ip in device_ips()]
+        )
+        resultado: list[SyncDispositivo] = []
+        for ip, eventos, error in descargas:
+            if error:
+                resultado.append(
+                    SyncDispositivo(
+                        dispositivoIp=ip,
+                        consultados=0,
+                        nuevos=0,
+                        duplicados=0,
+                        sinUsuario=0,
+                        error=error,
+                    )
+                )
+                continue
+            resultado.append(await _guardar_eventos(ip, eventos, inicio, fin, dia_final))
+        _anotar_sync(resultado)
+        return resultado
+
+
+async def _guardar_eventos(
+    ip: str, eventos: list[dict[str, Any]], inicio: datetime, fin: datetime, dia: str
+) -> SyncDispositivo:
+    utiles: list[tuple[str, dict[str, Any], datetime]] = []
     ignorados = 0
-    pendientes_llegada: list[dict[str, Any]] = []
-    ordenados = sorted(eventos, key=lambda item: str(item.get("time") or ""))
-    for evento in ordenados:
+    for evento in eventos:
         employee_no = str(evento.get("employeeNoString") or evento.get("employeeNo") or "").strip()
         serial = evento.get("serialNo")
         if not employee_no or serial is None:
@@ -1231,15 +1287,45 @@ async def _sincronizar_ip(ip: str, inicio: datetime, fin: datetime, dia: str) ->
         if int(evento.get("minor") or 0) not in MINORES_ASISTENCIA:
             ignorados += 1
             continue
-        serial_key = f"{ip}-{serial}"
-        existente = await db.asistencia.find_unique(where={"serialEvento": serial_key})
-        if existente:
+        cuando = _parse_evento_tiempo(evento.get("time")) or datetime.now(TZ)
+        local = cuando.astimezone(TZ)
+        if local < inicio or local > fin:
+            continue
+        utiles.append((employee_no, evento, cuando))
+    utiles.sort(key=lambda item: item[2])
+
+    seriales = [f"{ip}-{item[1].get('serialNo')}" for item in utiles]
+    ya: set[str] = set()
+    if seriales:
+        for fila in await db.asistencia.find_many(where={"serialEvento": {"in": seriales}}):
+            if fila.serialEvento:
+                ya.add(fila.serialEvento)
+
+    personas = {fila.employeeNo: fila for fila in await db.persona.find_many()}
+    marcas_previas = await db.asistencia.find_many(
+        where={"fechaHora": {"gte": inicio, "lte": fin}},
+        order={"fechaHora": "asc"},
+    )
+    ultimo_tipo: dict[tuple[int, str], str] = {}
+    ya_entrada: set[int] = set()
+    for marca in marcas_previas:
+        dia_marca = marca.fechaHora.astimezone(TZ).date().isoformat()
+        ultimo_tipo[(marca.personaId, dia_marca)] = marca.tipo
+        if marca.tipo == "ENTRADA" and dia_marca == dia:
+            ya_entrada.add(marca.personaId)
+    disp_id = await _dispositivo_id(ip)
+    hoy = datetime.now(TZ).date().isoformat()
+
+    nuevos = 0
+    duplicados = 0
+    creados_al_vuelo = 0
+    pendientes_llegada: list[dict[str, Any]] = []
+    for employee_no, evento, cuando in utiles:
+        serial_key = f"{ip}-{evento.get('serialNo')}"
+        if serial_key in ya:
             duplicados += 1
             continue
-        cuando = _parse_evento_tiempo(evento.get("time")) or datetime.now(TZ)
-        if cuando.astimezone(TZ).date() != inicio.date():
-            continue
-        persona = await db.persona.find_unique(where={"employeeNo": employee_no})
+        persona = personas.get(employee_no)
         if persona is None:
             nombre = str(evento.get("name") or f"Usuario {employee_no}").strip()
             persona = await db.persona.create(
@@ -1250,48 +1336,50 @@ async def _sincronizar_ip(ip: str, inicio: datetime, fin: datetime, dia: str) ->
                     "rol": "ADMIN" if employee_no == "1" else "ALUMNO",
                 }
             )
+            personas[employee_no] = persona
             creados_al_vuelo += 1
-        tipo = await _siguiente_tipo(persona.id, cuando)
-        hoy = datetime.now(TZ).date().isoformat()
-        if persona.rol == "ALUMNO" and tipo == "ENTRADA" and dia == hoy:
-            ya_entrada = await db.asistencia.find_first(
-                where={
+        dia_evento = cuando.astimezone(TZ).date().isoformat()
+        previo = ultimo_tipo.get((persona.id, dia_evento))
+        tipo = "ENTRADA" if previo is None or previo == "SALIDA" else "SALIDA"
+        if persona.rol == "ALUMNO" and tipo == "ENTRADA" and dia == hoy and persona.id not in ya_entrada:
+            ficha = await db.persona.find_unique(
+                where={"id": persona.id},
+                include={"detalleAlumno": {"include": {"grado": True}}},
+            )
+            detalle = getattr(ficha, "detalleAlumno", None) if ficha else None
+            grado = getattr(detalle, "grado", None) if detalle else None
+            etiqueta = ""
+            if grado is not None:
+                etiqueta = f"{grado.nombre.replace(' Primaria', '')} {grado.seccion}"
+            elif detalle is not None:
+                etiqueta = detalle.gradoId
+            pendientes_llegada.append(
+                {
                     "personaId": persona.id,
-                    "tipo": "ENTRADA",
-                    "fechaHora": {"gte": inicio, "lt": fin},
+                    "nombre": persona.nombre,
+                    "grado": etiqueta,
+                    "correoPadres": getattr(detalle, "correoPadres", None) if detalle else None,
+                    "hora": cuando.astimezone(TZ).strftime("%H:%M"),
                 }
             )
-            if ya_entrada is None:
-                ficha = await db.persona.find_unique(
-                    where={"id": persona.id},
-                    include={"detalleAlumno": {"include": {"grado": True}}},
-                )
-                detalle = getattr(ficha, "detalleAlumno", None) if ficha else None
-                grado = getattr(detalle, "grado", None) if detalle else None
-                etiqueta = ""
-                if grado is not None:
-                    etiqueta = f"{grado.nombre.replace(' Primaria', '')} {grado.seccion}"
-                elif detalle is not None:
-                    etiqueta = detalle.gradoId
-                pendientes_llegada.append(
-                    {
-                        "personaId": persona.id,
-                        "nombre": persona.nombre,
-                        "grado": etiqueta,
-                        "correoPadres": getattr(detalle, "correoPadres", None) if detalle else None,
-                        "hora": cuando.astimezone(TZ).strftime("%H:%M"),
-                    }
-                )
-        await db.asistencia.create(
-            data={
-                "personaId": persona.id,
-                "dispositivoId": await _dispositivo_id(ip),
-                "fechaHora": cuando,
-                "tipo": tipo,
-                "metodo": _metodo_evento(evento),
-                "serialEvento": serial_key,
-            }
-        )
+            ya_entrada.add(persona.id)
+        try:
+            await db.asistencia.create(
+                data={
+                    "personaId": persona.id,
+                    "dispositivoId": disp_id,
+                    "fechaHora": cuando,
+                    "tipo": tipo,
+                    "metodo": _metodo_evento(evento),
+                    "serialEvento": serial_key,
+                }
+            )
+        except UniqueViolationError:
+            duplicados += 1
+            ya.add(serial_key)
+            continue
+        ultimo_tipo[(persona.id, dia_evento)] = tipo
+        ya.add(serial_key)
         nuevos += 1
 
     await _despachar_llegadas(pendientes_llegada, dia)
@@ -1960,27 +2048,7 @@ async def sincronizar_asistencia(
     el reloj guarda los eventos, pero si no se bajan no aparecen en el tablero.
     """
     _inicio, _fin, dia_final = _inicio_fin_dia(fecha)
-    ultimo = datetime.strptime(dia_final, "%Y-%m-%d").date()
-
-    # Un acumulado por reloj, para que el resumen no se llene de una fila por día.
-    acumulado: dict[str, SyncDispositivo] = {}
-    for atras in range(dias):
-        objetivo = (ultimo - timedelta(days=atras)).isoformat()
-        inicio, fin, dia = _inicio_fin_dia(objetivo)
-        for ip in device_ips():
-            parcial = await _sincronizar_ip(ip, inicio, fin, dia)
-            previo = acumulado.get(ip)
-            if previo is None:
-                acumulado[ip] = parcial
-                continue
-            previo.consultados += parcial.consultados
-            previo.nuevos += parcial.nuevos
-            previo.duplicados += parcial.duplicados
-            previo.sinUsuario += parcial.sinUsuario
-            previo.ignorados += parcial.ignorados
-            previo.error = previo.error or parcial.error
-
-    dispositivos = [acumulado[ip] for ip in device_ips() if ip in acumulado]
+    dispositivos = await _bajar_marcajes(dia_final, dias)
     return SyncResult(
         fecha=dia_final,
         dias=dias,
@@ -1990,6 +2058,19 @@ async def sincronizar_asistencia(
         duplicados=sum(item.duplicados for item in dispositivos),
         sinUsuario=sum(item.sinUsuario for item in dispositivos),
         ignorados=sum(item.ignorados for item in dispositivos),
+    )
+
+
+@app.get("/api/asistencia/estado", response_model=SyncEstado)
+async def estado_asistencia(
+    _: Any = Depends(require_roles(*ROLES_CONSULTA, *ROLES_PROPIO)),
+) -> SyncEstado:
+    """El tablero pregunta esto cada pocos segundos para recargarse solo."""
+    return SyncEstado(
+        generacion=_sync_generacion,
+        ultimo=_sync_ultimo,
+        nuevos=_sync_nuevos,
+        intervaloSeg=SYNC_AUTO_SEG,
     )
 
 
