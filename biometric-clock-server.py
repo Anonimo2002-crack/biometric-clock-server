@@ -394,6 +394,7 @@ class AlumnoIn(BaseModel):
     contactoEmergenciaTelefono: str | None = None
     rolTablero: str | None = None
     usuarioTablero: str | None = None
+    claveTablero: str | None = None
 
 
 class AlumnoOut(BaseModel):
@@ -848,7 +849,11 @@ async def _sincronizar_cuenta_maestro(persona: Any, payload: AlumnoIn, sesion: A
     clave_nueva: str | None = None
     if cuenta is None:
         rol = pedido if puede_asignar and pedido else "DOCENTE"
-        clave_nueva = f"Mina{persona.employeeNo}2026"
+        clave_nueva = (payload.claveTablero or "").strip() if puede_asignar else ""
+        if clave_nueva and len(clave_nueva) < 6:
+            raise HTTPException(status_code=400, detail="La contraseña del tablero debe tener al menos 6 caracteres.")
+        if not clave_nueva:
+            clave_nueva = f"Mina{persona.employeeNo}2026"
         try:
             data_nueva: dict[str, Any] = {
                 "nombre": persona.nombre,
@@ -873,6 +878,11 @@ async def _sincronizar_cuenta_maestro(persona: Any, payload: AlumnoIn, sesion: A
         data["rol"] = pedido
     if puede_asignar and payload.usuarioTablero and payload.usuarioTablero.strip() != cuenta.usuario:
         data["usuario"] = usuario
+    if puede_asignar and (payload.claveTablero or "").strip():
+        clave = payload.claveTablero.strip()
+        if len(clave) < 6:
+            raise HTTPException(status_code=400, detail="La contraseña del tablero debe tener al menos 6 caracteres.")
+        data["passwordHash"] = hash_password(clave)
     try:
         await db.usuario.update(where={"id": cuenta.id}, data=data)
     except UniqueViolationError as exc:
@@ -1428,18 +1438,17 @@ async def crear_usuario(payload: UsuarioIn, _: Any = Depends(require_roles(*ROLE
     if not payload.password or len(payload.password.strip()) < 6:
         raise HTTPException(status_code=400, detail="La contraseña debe tener al menos 6 caracteres.")
     rol = _validar_rol_sistema(payload.rol)
-    persona_id = await _persona_de_consulta(rol, payload.personaId)
+    data_usuario: dict[str, Any] = {
+        "nombre": payload.nombre.strip(),
+        "usuario": payload.usuario.strip(),
+        "passwordHash": hash_password(payload.password.strip()),
+        "rol": rol,
+        "activo": payload.activo,
+    }
+    if _usuario_tiene_persona():
+        data_usuario["personaId"] = await _persona_de_consulta(rol, payload.personaId)
     try:
-        fila = await db.usuario.create(
-            data={
-                "nombre": payload.nombre.strip(),
-                "usuario": payload.usuario.strip(),
-                "passwordHash": hash_password(payload.password.strip()),
-                "rol": rol,
-                "activo": payload.activo,
-                "personaId": persona_id,
-            },
-        )
+        fila = await db.usuario.create(data=data_usuario)
     except UniqueViolationError as exc:
         raise HTTPException(status_code=409, detail="Ese usuario ya existe.") from exc
     return await _usuario_out(fila)
@@ -1460,8 +1469,9 @@ async def editar_usuario(
         "usuario": payload.usuario.strip(),
         "rol": rol,
         "activo": payload.activo,
-        "personaId": await _persona_de_consulta(rol, payload.personaId),
     }
+    if _usuario_tiene_persona():
+        data["personaId"] = await _persona_de_consulta(rol, payload.personaId)
     if payload.password and payload.password.strip():
         if len(payload.password.strip()) < 6:
             raise HTTPException(status_code=400, detail="La contraseña debe tener al menos 6 caracteres.")
