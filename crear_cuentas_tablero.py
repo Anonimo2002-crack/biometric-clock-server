@@ -85,9 +85,14 @@ async def main() -> None:
         clave = f"Mina{persona.employeeNo}2026"
         actual = existentes.get(usuario.lower())
         if actual is not None:
+            extras = {}
+            if actual.personaId != persona.id:
+                extras["personaId"] = persona.id
             if es_direccion(cargo) and actual.rol != "ADMIN":
-                await db.usuario.update(where={"id": actual.id}, data={"rol": "ADMIN"})
-                print(f"{persona.nombre}\t{cargo}\tADMIN\t{usuario}\t(sin cambio)\trol actualizado a ADMIN")
+                extras["rol"] = "ADMIN"
+            if extras:
+                await db.usuario.update(where={"id": actual.id}, data=extras)
+                print(f"{persona.nombre}\t{cargo}\t{extras.get('rol', actual.rol)}\t{usuario}\t(sin cambio)\tactualizado")
             else:
                 print(f"{persona.nombre}\t{cargo}\t{actual.rol}\t{usuario}\t(sin cambio)\tya existía")
             continue
@@ -98,6 +103,7 @@ async def main() -> None:
                 "passwordHash": hash_password(clave),
                 "rol": rol,
                 "activo": True,
+                "personaId": persona.id,
             }
         )
         existentes[usuario.lower()] = creado

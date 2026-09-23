@@ -287,69 +287,207 @@ class HikvisionClient:
         return 0
 
     def delete_fingerprints(self, employee_no: str) -> None:
-        intentos = [
-            {"FingerPrintDelete": {"EmployeeNoDetail": {"employeeNo": employee_no}}},
+        """Quita las huellas de esa persona. Este modelo pide employeeNo bien
+        anidado; si el JSON no le entra, se manda XML o se borra dedo por dedo
+        con el mismo FingerPrintCfg que sí acepta al guardar."""
+        numero = str(employee_no).strip()
+        if not numero:
+            raise HikvisionError("Falta el número de reloj para borrar la huella.")
+        dedos = self._ids_huella(numero) or list(range(1, 11))
+        ultimo: HikvisionError | None = None
+        acepto = False
+        for cuerpo in self._cuerpos_borrar_huella(numero, dedos):
+            try:
+                respuesta = self._request(
+                    "PUT",
+                    "/ISAPI/AccessControl/FingerPrint/Delete?format=json",
+                    json=cuerpo,
+                )
+                self._ok_reloj(respuesta, f"borrar huellas del {numero}")
+                acepto = True
+                if self._huellas_restantes(numero) == 0:
+                    return
+            except HikvisionError as exc:
+                ultimo = exc
+        for xml in self._xml_borrar_huella(numero, dedos):
+            try:
+                respuesta = self._request(
+                    "PUT",
+                    "/ISAPI/AccessControl/FingerPrint/Delete",
+                    data=xml.encode("utf-8"),
+                    headers={"Content-Type": "application/xml"},
+                )
+                self._ok_reloj(respuesta, f"borrar huellas del {numero}")
+                acepto = True
+                if self._huellas_restantes(numero) == 0:
+                    return
+            except HikvisionError as exc:
+                ultimo = exc
+        if self._borrar_huellas_por_cfg(numero, dedos):
+            return
+        if self._huellas_restantes(numero) == 0:
+            return
+        if acepto:
+            raise HikvisionError(
+                f"El reloj {self.ip} dijo que borró, pero sigue con huella del {numero}."
+            )
+        if ultimo:
+            raise ultimo
+        raise HikvisionError(f"No se pudieron borrar las huellas del {numero} en {self.ip}.")
+
+    def _cuerpos_borrar_huella(self, employee_no: str, dedos: list[int]) -> list[dict[str, Any]]:
+        return [
+            {
+                "FingerPrintDelete": {
+                    "EmployeeNoDetail": {
+                        "employeeNo": employee_no,
+                        "fingerPrintID": dedos,
+                    }
+                }
+            },
+            {
+                "FingerPrintDelete": {
+                    "mode": "byEmployeeNo",
+                    "EmployeeNoDetail": {
+                        "employeeNo": employee_no,
+                        "fingerPrintID": list(range(1, 11)),
+                        "enableCardReader": [1],
+                    },
+                }
+            },
+            {"FingerPrintDelete": {"employeeNo": employee_no}},
+            {
+                "FingerPrintDelete": {
+                    "employeeNo": employee_no,
+                    "fingerPrintID": dedos,
+                }
+            },
             {
                 "FingerPrintDelete": {
                     "mode": "byEmployeeNo",
                     "EmployeeNoList": [{"employeeNo": employee_no}],
                 }
             },
-            {
-                "FingerPrintDelete": {
-                    "mode": "byEmployeeNo",
-                    "EmployeeNoDetail": [{"employeeNo": employee_no}],
-                }
-            },
         ]
-        acepto = False
-        ultimo: HikvisionError | None = None
-        for cuerpo in intentos:
-            respuesta = self._request(
-                "PUT", "/ISAPI/AccessControl/FingerPrint/Delete?format=json", json=cuerpo
-            )
-            try:
-                self._json_ok(respuesta, f"borrar huellas del {employee_no}")
-                acepto = True
-                if self._huellas_restantes(employee_no) == 0:
-                    return
-            except HikvisionError as exc:
-                ultimo = exc
-        self._borrar_huellas_por_dedo(employee_no)
-        if self._huellas_restantes(employee_no) == 0:
-            return
-        if acepto:
-            raise HikvisionError(
-                f"El reloj {self.ip} dijo que borró, pero sigue con huella del {employee_no}."
-            )
-        if ultimo:
-            raise ultimo
-        raise HikvisionError(f"No se pudieron borrar las huellas del {employee_no} en {self.ip}.")
 
-    def _borrar_huellas_por_dedo(self, employee_no: str) -> None:
-        for dedo in range(1, 11):
+    def _xml_borrar_huella(self, employee_no: str, dedos: list[int]) -> list[str]:
+        ids = "".join(f"<fingerPrintID>{dedo}</fingerPrintID>" for dedo in dedos)
+        return [
+            (
+                '<?xml version="1.0" encoding="UTF-8"?>'
+                '<FingerPrintDelete version="2.0" '
+                'xmlns="http://www.isapi.org/ver20/XMLSchema">'
+                "<EmployeeNoDetail>"
+                f"<employeeNo>{employee_no}</employeeNo>"
+                f"{ids}"
+                "</EmployeeNoDetail>"
+                "</FingerPrintDelete>"
+            ),
+            (
+                '<?xml version="1.0" encoding="UTF-8"?>'
+                '<FingerPrintDelete version="2.0" '
+                'xmlns="http://www.isapi.org/ver20/XMLSchema">'
+                f"<employeeNo>{employee_no}</employeeNo>"
+                "</FingerPrintDelete>"
+            ),
+        ]
+
+    def _borrar_huellas_por_cfg(self, employee_no: str, dedos: list[int]) -> bool:
+        """Mismo cuerpo que al guardar, con deleteFingerPrint. Este modelo sí
+        entiende employeeNo ahí."""
+        rutas = (
+            "/ISAPI/AccessControl/FingerPrint/SetUp?format=json",
+            "/ISAPI/AccessControl/FingerPrintDownload?format=json",
+        )
+        algo = False
+        for dedo in dedos:
             cuerpo = {
-                "FingerPrintDelete": {
-                    "mode": "byFingerPrintID",
+                "FingerPrintCfg": {
+                    "employeeNo": employee_no,
                     "fingerPrintID": dedo,
-                    "EmployeeNoDetail": {"employeeNo": employee_no},
+                    "fingerType": "normalFP",
+                    "enableCardReader": [1],
+                    "deleteFingerPrint": True,
                 }
             }
+            for ruta in rutas:
+                try:
+                    respuesta = self._request("POST", ruta, json=cuerpo)
+                    self._ok_reloj(respuesta, f"borrar el dedo {dedo} del {employee_no}")
+                    algo = True
+                    break
+                except HikvisionError:
+                    continue
+        return algo and self._huellas_restantes(employee_no) == 0
+
+    def _ok_reloj(self, respuesta: requests.Response, accion: str) -> dict[str, Any]:
+        if respuesta.status_code != 200:
+            raise HikvisionError(f"{accion}: HTTP {respuesta.status_code} {respuesta.text[:300]}")
+        texto = respuesta.text or ""
+        if texto.lstrip().startswith("{"):
+            return self._json_ok(respuesta, accion)
+        estado = ""
+        if "<" in texto:
             try:
-                respuesta = self._request(
-                    "PUT", "/ISAPI/AccessControl/FingerPrint/Delete?format=json", json=cuerpo
-                )
-                self._json_ok(respuesta, f"borrar el dedo {dedo} del {employee_no}")
-            except HikvisionError:
-                continue
+                root = ET.fromstring(texto[texto.find("<") :])
+                estado = _xml_texto(root, "statusCode")
+                if estado and estado != "1":
+                    detalle = (
+                        _xml_texto(root, "errorMsg")
+                        or _xml_texto(root, "subStatusCode")
+                        or _xml_texto(root, "statusString")
+                        or estado
+                    )
+                    raise HikvisionError(f"{accion}: el reloj respondió '{detalle}'")
+            except ET.ParseError:
+                pass
+        return {}
+
+    def _ids_huella(self, employee_no: str) -> list[int] | None:
+        cuerpo = {
+            "FingerPrintCond": {
+                "searchID": str(uuid.uuid4())[:32],
+                "employeeNo": employee_no,
+            }
+        }
+        try:
+            respuesta = self._request(
+                "POST",
+                "/ISAPI/AccessControl/FingerPrintUpload?format=json",
+                json=cuerpo,
+            )
+            datos = self._ok_reloj(respuesta, f"listar huellas del {employee_no}")
+        except HikvisionError:
+            return None
+        info = datos.get("FingerPrintInfo") or datos
+        estado = str(info.get("status") or "").lower()
+        if estado in {"nofp", "no match", "nomatch"}:
+            return []
+        lista = info.get("FingerPrintList") or []
+        if isinstance(lista, dict):
+            lista = [lista]
+        ids: list[int] = []
+        for item in lista:
+            valor = item.get("fingerPrintID") or item.get("fingerNo")
+            if valor is not None and str(valor).isdigit():
+                ids.append(int(valor))
+        return ids or None
 
     def _huellas_restantes(self, employee_no: str) -> int:
-        time.sleep(0.35)
+        time.sleep(0.4)
+        ids = self._ids_huella(employee_no)
+        if ids is not None:
+            return len(ids)
+        fila = self.buscar_usuario(employee_no) or {}
+        en_ficha = int(fila.get("numOfFP") or fila.get("fingerPrintNum") or 0)
+        if 0 <= en_ficha <= 10:
+            return en_ficha
         try:
-            return self.count_fingerprints(employee_no)
+            total = self.count_fingerprints(employee_no)
         except HikvisionError:
-            fila = self.buscar_usuario(employee_no) or {}
-            return int(fila.get("numOfFP") or fila.get("fingerPrintNum") or 0)
+            return en_ficha
+        # Más de 10 suele ser el total del aparato, no el de esta persona.
+        return total if total <= 10 else en_ficha
 
     def buscar_usuario(self, employee_no: str) -> dict[str, Any] | None:
         cuerpo = {

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import os
 import re
+import unicodedata
 from contextlib import asynccontextmanager, suppress
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -31,6 +32,7 @@ from auth import (
     ROLES_SMTP,
     ROLES_SYNC,
     ROLES_USUARIOS,
+    ROLES_ASIGNAR,
     anotar_fallo,
     crear_token,
     hash_password,
@@ -390,6 +392,8 @@ class AlumnoIn(BaseModel):
     contactoEmergenciaNombre: str | None = None
     contactoEmergenciaParentesco: str | None = None
     contactoEmergenciaTelefono: str | None = None
+    rolTablero: str | None = None
+    usuarioTablero: str | None = None
 
 
 class AlumnoOut(BaseModel):
@@ -410,6 +414,9 @@ class AlumnoOut(BaseModel):
     contactoEmergenciaNombre: str | None = None
     contactoEmergenciaParentesco: str | None = None
     contactoEmergenciaTelefono: str | None = None
+    rolTablero: str | None = None
+    usuarioTablero: str | None = None
+    claveTablero: str | None = None
 
     @field_serializer("fechaNacimiento")
     def _solo_fecha(self, valor: datetime | None) -> str | None:
@@ -775,11 +782,129 @@ INCLUDE_PERSONA: dict[str, Any] = {
     "detalleCatedratico": True,
 }
 
+_PARTICULAS_USUARIO = {"de", "del", "la", "las", "los", "y", "da", "do"}
 
-def _alumno_out(fila: Any) -> AlumnoOut:
+
+def _usuario_de_nombre(nombre: str) -> str:
+    nfd = unicodedata.normalize("NFD", nombre or "")
+    limpio = "".join(ch for ch in nfd if unicodedata.category(ch) != "Mn")
+    limpio = re.sub(r"[^a-zA-ZñÑ\s]", " ", limpio)
+    partes = [p.lower() for p in limpio.split() if p.lower() not in _PARTICULAS_USUARIO]
+    if len(partes) >= 4:
+        return f"{partes[0]}.{partes[2]}"
+    if len(partes) >= 2:
+        return f"{partes[0]}.{partes[1]}"
+    return partes[0] if partes else "maestro"
+
+
+def _cuenta_de_persona(fila: Any) -> Any | None:
+    cuentas = list(getattr(fila, "cuentas", None) or [])
+    vigentes = [item for item in cuentas if getattr(item, "activo", True)]
+    return (vigentes or cuentas or [None])[0]
+
+
+async def _buscar_cuenta_maestro(persona: Any) -> Any | None:
+    cuenta = await db.usuario.find_first(where={"personaId": persona.id})
+    if cuenta is not None:
+        return cuenta
+    slug = _usuario_de_nombre(persona.nombre)
+    cuenta = await db.usuario.find_first(where={"usuario": slug})
+    if cuenta is not None:
+        return cuenta
+    return await db.usuario.find_first(where={"nombre": persona.nombre})
+
+
+async def _sincronizar_cuenta_maestro(persona: Any, payload: AlumnoIn, sesion: Any) -> str | None:
+    """Crea o actualiza el login del tablero. Solo ADMIN/DIRECCION cambian el rol."""
+    if persona.rol != "CATEDRATICO":
+        return None
+    pedido = (payload.rolTablero or "").strip().upper() or None
+    if pedido == "PROPIO":
+        raise HTTPException(status_code=400, detail="El rol de consulta propia no se asigna a un maestro.")
+    if pedido and pedido not in ROLES_SISTEMA:
+        raise HTTPException(status_code=400, detail="Ese rol del tablero no existe.")
+    puede_asignar = getattr(sesion, "rol", None) in ROLES_ASIGNAR
+    if not puede_asignar:
+        pedido = None
+
+    cuenta = await _buscar_cuenta_maestro(persona)
+    deseado = (payload.usuarioTablero or "").strip() or _usuario_de_nombre(persona.nombre)
+    usuario = await _usuario_disponible(deseado, persona.employeeNo, None if cuenta is None else cuenta.id)
+    clave_nueva: str | None = None
+    if cuenta is None:
+        rol = pedido if puede_asignar and pedido else "DOCENTE"
+        clave_nueva = f"Mina{persona.employeeNo}2026"
+        try:
+            await db.usuario.create(
+                data={
+                    "nombre": persona.nombre,
+                    "usuario": usuario,
+                    "passwordHash": hash_password(clave_nueva),
+                    "rol": rol,
+                    "activo": True,
+                    "personaId": persona.id,
+                }
+            )
+        except UniqueViolationError as exc:
+            raise HTTPException(status_code=409, detail="Ese usuario del tablero ya existe.") from exc
+        return clave_nueva
+
+    if cuenta.id == getattr(sesion, "id", None) and pedido and pedido != cuenta.rol:
+        raise HTTPException(status_code=400, detail="No se puede cambiar el propio rol.")
+    data: dict[str, Any] = {"nombre": persona.nombre, "personaId": persona.id}
+    if puede_asignar and pedido:
+        data["rol"] = pedido
+    if puede_asignar and payload.usuarioTablero and payload.usuarioTablero.strip() != cuenta.usuario:
+        data["usuario"] = usuario
+    try:
+        await db.usuario.update(where={"id": cuenta.id}, data=data)
+    except UniqueViolationError as exc:
+        raise HTTPException(status_code=409, detail="Ese usuario del tablero ya existe.") from exc
+    return None
+
+
+async def _usuario_disponible(deseado: str, employee_no: str, excepto_id: int | None) -> str:
+    candidato = deseado
+    extra = employee_no
+    while True:
+        otro = await db.usuario.find_first(where={"usuario": candidato})
+        if otro is None or otro.id == excepto_id:
+            return candidato
+        candidato = f"{deseado}.{extra}"
+        extra = f"{extra}x"
+
+
+async def _indice_cuentas() -> tuple[dict[int, Any], dict[str, Any], dict[str, Any]]:
+    por_persona: dict[int, Any] = {}
+    por_usuario: dict[str, Any] = {}
+    por_nombre: dict[str, Any] = {}
+    for cuenta in await db.usuario.find_many():
+        if cuenta.personaId:
+            por_persona[cuenta.personaId] = cuenta
+        por_usuario[cuenta.usuario] = cuenta
+        por_nombre[cuenta.nombre] = cuenta
+    return por_persona, por_usuario, por_nombre
+
+
+def _cuenta_para(
+    fila: Any,
+    por_persona: dict[int, Any],
+    por_usuario: dict[str, Any],
+    por_nombre: dict[str, Any],
+) -> Any | None:
+    return (
+        por_persona.get(fila.id)
+        or por_usuario.get(_usuario_de_nombre(fila.nombre))
+        or por_nombre.get(fila.nombre)
+        or _cuenta_de_persona(fila)
+    )
+
+
+def _alumno_out(fila: Any, cuenta: Any | None = None, clave: str | None = None) -> AlumnoOut:
     """Aplana Persona + su detalle al formato que ya conoce el tablero."""
     alumno = getattr(fila, "detalleAlumno", None)
     catedratico = getattr(fila, "detalleCatedratico", None)
+    cuenta = cuenta or _cuenta_de_persona(fila)
     return AlumnoOut(
         id=fila.id,
         nombre=fila.nombre,
@@ -798,6 +923,9 @@ def _alumno_out(fila: Any) -> AlumnoOut:
         contactoEmergenciaNombre=getattr(alumno, "contactoEmergenciaNombre", None) if alumno else None,
         contactoEmergenciaParentesco=getattr(alumno, "contactoEmergenciaParentesco", None) if alumno else None,
         contactoEmergenciaTelefono=getattr(alumno, "contactoEmergenciaTelefono", None) if alumno else None,
+        rolTablero=getattr(cuenta, "rol", None),
+        usuarioTablero=getattr(cuenta, "usuario", None),
+        claveTablero=clave,
     )
 
 
@@ -1470,7 +1598,8 @@ async def listar_alumnos(
     if rol:
         where["rol"] = rol.upper()
     filas = await db.persona.find_many(where=where, include=INCLUDE_PERSONA, order={"nombre": "asc"})
-    return [_alumno_out(fila) for fila in filas]
+    indice = await _indice_cuentas()
+    return [_alumno_out(fila, cuenta=_cuenta_para(fila, *indice)) for fila in filas]
 
 
 @app.get("/api/alumnos/siguiente-codigo")
@@ -1489,7 +1618,7 @@ async def siguiente_codigo(
 @app.post("/api/alumnos", response_model=AlumnoOut)
 async def crear_alumno(
     payload: AlumnoIn,
-    _: Any = Depends(require_roles(*ROLES_MATRICULA_ESCRIBIR)),
+    sesion: Any = Depends(require_roles(*ROLES_MATRICULA_ESCRIBIR)),
 ) -> AlumnoOut:
     base, detalle_alumno, detalle_catedratico = await _partes_persona(payload)
     if detalle_alumno is not None:
@@ -1500,14 +1629,16 @@ async def crear_alumno(
         fila = await db.persona.create(data=base, include=INCLUDE_PERSONA)
     except UniqueViolationError as exc:
         raise HTTPException(status_code=409, detail="Ese CUI ya está registrado.") from exc
-    return _alumno_out(fila)
+    clave = await _sincronizar_cuenta_maestro(fila, payload, sesion)
+    cuenta = await _buscar_cuenta_maestro(fila)
+    return _alumno_out(fila, cuenta=cuenta, clave=clave)
 
 
 @app.put("/api/alumnos/{alumno_id}", response_model=AlumnoOut)
 async def editar_alumno(
     alumno_id: int,
     payload: AlumnoIn,
-    _: Any = Depends(require_roles(*ROLES_MATRICULA_ESCRIBIR)),
+    sesion: Any = Depends(require_roles(*ROLES_MATRICULA_ESCRIBIR)),
 ) -> AlumnoOut:
     actual = await db.persona.find_unique(where={"id": alumno_id})
     if actual is None:
@@ -1519,7 +1650,11 @@ async def editar_alumno(
         raise HTTPException(status_code=409, detail="Ese CUI ya está registrado.") from exc
     await _guardar_detalles(alumno_id, detalle_alumno, detalle_catedratico)
     fila = await db.persona.find_unique(where={"id": alumno_id}, include=INCLUDE_PERSONA)
-    return _alumno_out(fila)
+    if fila is None:
+        raise HTTPException(status_code=404, detail="No está en la matrícula.")
+    clave = await _sincronizar_cuenta_maestro(fila, payload, sesion)
+    cuenta = await _buscar_cuenta_maestro(fila)
+    return _alumno_out(fila, cuenta=cuenta, clave=clave)
 
 
 def _borrar_biometricos_reloj(ip: str, employee_no: str) -> None:
