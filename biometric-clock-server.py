@@ -803,10 +803,25 @@ def _cuenta_de_persona(fila: Any) -> Any | None:
     return (vigentes or cuentas or [None])[0]
 
 
+def _usuario_tiene_persona() -> bool:
+    try:
+        from prisma.models import Usuario
+
+        return "personaId" in getattr(Usuario, "model_fields", {})
+    except Exception:
+        return False
+
+
+def _persona_id_cuenta(cuenta: Any) -> int | None:
+    valor = getattr(cuenta, "personaId", None)
+    return int(valor) if valor else None
+
+
 async def _buscar_cuenta_maestro(persona: Any) -> Any | None:
-    cuenta = await db.usuario.find_first(where={"personaId": persona.id})
-    if cuenta is not None:
-        return cuenta
+    if _usuario_tiene_persona():
+        cuenta = await db.usuario.find_first(where={"personaId": persona.id})
+        if cuenta is not None:
+            return cuenta
     slug = _usuario_de_nombre(persona.nombre)
     cuenta = await db.usuario.find_first(where={"usuario": slug})
     if cuenta is not None:
@@ -835,23 +850,25 @@ async def _sincronizar_cuenta_maestro(persona: Any, payload: AlumnoIn, sesion: A
         rol = pedido if puede_asignar and pedido else "DOCENTE"
         clave_nueva = f"Mina{persona.employeeNo}2026"
         try:
-            await db.usuario.create(
-                data={
-                    "nombre": persona.nombre,
-                    "usuario": usuario,
-                    "passwordHash": hash_password(clave_nueva),
-                    "rol": rol,
-                    "activo": True,
-                    "personaId": persona.id,
-                }
-            )
+            data_nueva: dict[str, Any] = {
+                "nombre": persona.nombre,
+                "usuario": usuario,
+                "passwordHash": hash_password(clave_nueva),
+                "rol": rol,
+                "activo": True,
+            }
+            if _usuario_tiene_persona():
+                data_nueva["personaId"] = persona.id
+            await db.usuario.create(data=data_nueva)
         except UniqueViolationError as exc:
             raise HTTPException(status_code=409, detail="Ese usuario del tablero ya existe.") from exc
         return clave_nueva
 
     if cuenta.id == getattr(sesion, "id", None) and pedido and pedido != cuenta.rol:
         raise HTTPException(status_code=400, detail="No se puede cambiar el propio rol.")
-    data: dict[str, Any] = {"nombre": persona.nombre, "personaId": persona.id}
+    data: dict[str, Any] = {"nombre": persona.nombre}
+    if _usuario_tiene_persona():
+        data["personaId"] = persona.id
     if puede_asignar and pedido:
         data["rol"] = pedido
     if puede_asignar and payload.usuarioTablero and payload.usuarioTablero.strip() != cuenta.usuario:
@@ -879,8 +896,9 @@ async def _indice_cuentas() -> tuple[dict[int, Any], dict[str, Any], dict[str, A
     por_usuario: dict[str, Any] = {}
     por_nombre: dict[str, Any] = {}
     for cuenta in await db.usuario.find_many():
-        if cuenta.personaId:
-            por_persona[cuenta.personaId] = cuenta
+        persona_id = _persona_id_cuenta(cuenta)
+        if persona_id:
+            por_persona[persona_id] = cuenta
         por_usuario[cuenta.usuario] = cuenta
         por_nombre[cuenta.nombre] = cuenta
     return por_persona, por_usuario, por_nombre
@@ -1598,8 +1616,11 @@ async def listar_alumnos(
     if rol:
         where["rol"] = rol.upper()
     filas = await db.persona.find_many(where=where, include=INCLUDE_PERSONA, order={"nombre": "asc"})
-    indice = await _indice_cuentas()
-    return [_alumno_out(fila, cuenta=_cuenta_para(fila, *indice)) for fila in filas]
+    try:
+        indice = await _indice_cuentas()
+        return [_alumno_out(fila, cuenta=_cuenta_para(fila, *indice)) for fila in filas]
+    except Exception:
+        return [_alumno_out(fila) for fila in filas]
 
 
 @app.get("/api/alumnos/siguiente-codigo")

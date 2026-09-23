@@ -86,7 +86,7 @@ async def main() -> None:
         actual = existentes.get(usuario.lower())
         if actual is not None:
             extras = {}
-            if actual.personaId != persona.id:
+            if hasattr(actual, "personaId") and actual.personaId != persona.id:
                 extras["personaId"] = persona.id
             if es_direccion(cargo) and actual.rol != "ADMIN":
                 extras["rol"] = "ADMIN"
@@ -103,7 +103,6 @@ async def main() -> None:
                 "passwordHash": hash_password(clave),
                 "rol": rol,
                 "activo": True,
-                "personaId": persona.id,
             }
         )
         existentes[usuario.lower()] = creado
