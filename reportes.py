@@ -94,6 +94,11 @@ def _ultima_salida(marcajes: list[Any], inicio: datetime, fin: datetime) -> date
     return max(salidas) if salidas else None
 
 
+def _ultima_marca(marcajes: list[Any], inicio: datetime, fin: datetime) -> datetime | None:
+    horas = [row.fechaHora for row in marcajes if _en_el_dia(row.fechaHora, inicio, fin)]
+    return max(horas) if horas else None
+
+
 def _rango_dia(fecha: str) -> tuple[datetime, datetime]:
     inicio = datetime.strptime(fecha, "%Y-%m-%d").replace(tzinfo=TZ)
     return inicio, inicio + timedelta(days=1)
@@ -258,8 +263,11 @@ def _alumno_asistencia(
     hora_corte: str | None = None,
 ) -> dict[str, Any]:
     grado_id, grado_texto = _grado_de(persona)
-    entrada = _primera_entrada(persona.marcajes or [], inicio, fin)
-    hora_marca = _hora_hhmm(entrada) if entrada else None
+    marcajes = persona.marcajes or []
+    entrada = _primera_entrada(marcajes, inicio, fin)
+    ultima = _ultima_marca(marcajes, inicio, fin)
+    hora_marca = _hora_hhmm(ultima) if ultima else None
+    hora_entrada = _hora_hhmm(entrada) if entrada else None
     detalle = getattr(persona, "detalleAlumno", None)
     encargado, telefono = _encargado_de(detalle)
     return {
@@ -273,7 +281,7 @@ def _alumno_asistencia(
         "encargado": encargado,
         "telefonoEncargado": telefono,
         "horaMarca": hora_marca,
-        "estado": estado_por_hora(hora_marca, HORA_LIMITE_TARDE_ALUMNOS, hora_corte),
+        "estado": estado_por_hora(hora_entrada, HORA_LIMITE_TARDE_ALUMNOS, hora_corte),
     }
 
 
